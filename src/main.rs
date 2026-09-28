@@ -47,8 +47,13 @@ async fn main() -> Result<()> {
 
     let mut terminal = ratatui::init(); // installs a panic hook that restores the terminal
     // Must run after entering the alternate screen and before the input task starts reading stdin.
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
+    let mut picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    // herdr relays the outer terminal's capability replies (Kitty) but drops the graphics
+    // itself, leaving a blank image; colored half-blocks are ordinary text and pass through.
+    if std::env::var_os("HERDR_ENV").is_some() {
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Halfblocks);
+    }
     event::spawn_input(tx.clone());
     let data_cache = cache::Cache::new(paths.cache_dir.join("data"));
     let mut app = App::new(api, started.handle, data_cache, tx, started.volume, picker);
