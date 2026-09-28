@@ -240,14 +240,21 @@ impl PlayerHandle {
         }
     }
 
+    /// Spirc ignores every command unless this device is the active Connect device, and another
+    /// device may have taken over since we last played. Activating first is a no-op if we're active.
+    fn load(&self, request: LoadRequest) {
+        let _ = self.spirc.activate();
+        let _ = self.spirc.load(request);
+    }
+
     /// Play a playlist/album/artist context starting at `index`.
     pub fn play_context(&self, uri: String, index: usize) {
-        let _ = self.spirc.load(LoadRequest::from_context_uri(uri, Self::opts(index)));
+        self.load(LoadRequest::from_context_uri(uri, Self::opts(index)));
     }
 
     /// Play an explicit list of track URIs starting at `index`.
     pub fn play_tracks(&self, uris: Vec<String>, index: usize) {
-        let _ = self.spirc.load(LoadRequest::from_tracks(uris, Self::opts(index)));
+        self.load(LoadRequest::from_tracks(uris, Self::opts(index)));
     }
 
     pub fn shutdown(&self) {
