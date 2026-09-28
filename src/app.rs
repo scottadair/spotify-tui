@@ -2,7 +2,7 @@ use crate::api::{
     Api, HttpError,
     models::{Album, Artist, Playlist, SearchResults, Track},
 };
-use crate::browse::{self, Category};
+use crate::browse::{self, Category, Group, Item};
 use crate::cache::Cache;
 use crate::event::{Data, Event};
 use crate::player::{PlaybackEvent, PlayerHandle, TrackInfo};
@@ -18,7 +18,7 @@ const STATUS_TTL: Duration = Duration::from_secs(5);
 
 /// Cached track lists newer than this are shown without touching the network.
 const TRACKS_FRESH: Duration = Duration::from_secs(5 * 60);
-const POPULAR_TTL: Duration = Duration::from_secs(60 * 60);
+const SECTION_TTL: Duration = Duration::from_secs(60 * 60);
 const CATEGORY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const TOP_ARTISTS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -68,11 +68,12 @@ pub struct TrackCache {
 }
 
 /// A page under Browse.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Section {
-    /// Spotify's live popular playlists.
-    Popular,
-    Category(&'static Category),
+    /// A browse page: a top-level category or a sub-page of one.
+    Page(Category),
+    /// One shelf of a page.
+    Group(Group),
     /// Radio stations seeded by your top artists.
     Stations,
     Recent,
@@ -81,11 +82,19 @@ pub enum Section {
 impl Section {
     pub fn label(&self) -> &str {
         match self {
-            Section::Popular => "Popular Playlists",
-            Section::Category(c) => c.name,
+            Section::Page(c) => &c.name,
+            Section::Group(g) => &g.title,
             Section::Stations => "Radio Stations (from your top artists)",
             Section::Recent => "Recently Played",
         }
+    }
+}
+
+fn browse_entry(item: Item) -> Entry {
+    match item {
+        Item::Playlist(p) => Entry::Playlist(p),
+        Item::Album(a) => Entry::Album(a),
+        Item::Page(c) => Entry::Section(Section::Page(c)),
     }
 }
 
@@ -643,11 +652,23 @@ impl App {
                 self.view = Some(View::Entries(list));
             }
             SidebarItem::Browse => {
-                let mut entries = vec![Entry::Section(Section::Popular)];
-                entries.extend(browse::CATEGORIES.iter().map(|c| Entry::Section(Section::Category(c))));
-                entries.push(Entry::Section(Section::Stations));
-                entries.push(Entry::Section(Section::Recent));
-                self.view = Some(View::Entries(EntryList::new("Browse", entries, false, 0)));
+                // Stations and Recent stay reachable if the live catalogue fails to load.
+                let fixed = [Entry::Section(Section::Stations), Entry::Section(Section::Recent)];
+                let load = self.new_load();
+                self.view = Some(View::Entries(EntryList::new("Browse", fixed.to_vec(), true, load)));
+                let session = self.player.session().clone();
+                self.spawn_entries(
+                    load,
+                    "browse-categories".into(),
+                    CATEGORY_TTL,
+                    async move { browse::categories(&session).await },
+                    |cats: Vec<Category>| {
+                        cats.into_iter()
+                            .map(|c| Entry::Section(Section::Page(c)))
+                            .chain([Entry::Section(Section::Stations), Entry::Section(Section::Recent)])
+                            .collect()
+                    },
+                );
             }
             SidebarItem::Liked => {
                 let load = self.new_load();
@@ -682,26 +703,19 @@ impl App {
         self.push_view(View::Entries(EntryList::new(section.label(), Vec::new(), true, load)));
         let session = self.player.session().clone();
         match section {
-            Section::Popular => self.spawn_entries(
+            Section::Page(c) => self.spawn_entries(
                 load,
-                "browse-popular".into(),
-                POPULAR_TTL,
-                async move { browse::popular_playlists(&session).await },
-                |items: Vec<Playlist>| items.into_iter().map(Entry::Playlist).collect(),
-            ),
-            Section::Category(c) => self.spawn_entries(
-                load,
-                format!("browse-cat-{}", c.name),
+                format!("browse-page-{}", c.uri),
                 CATEGORY_TTL,
-                async move {
-                    let items = browse::category_playlists(&session, c).await;
-                    // An empty result means lookups failed; don't cache or show a blank page.
-                    if items.is_empty() {
-                        anyhow::bail!("no playlists resolved for {}", c.name);
-                    }
-                    Ok(items)
-                },
-                |items: Vec<Playlist>| items.into_iter().map(Entry::Playlist).collect(),
+                async move { browse::page_groups(&session, &c.uri).await },
+                |groups: Vec<Group>| groups.into_iter().map(|g| Entry::Section(Section::Group(g))).collect(),
+            ),
+            Section::Group(g) => self.spawn_entries(
+                load,
+                format!("browse-section-{}", g.uri),
+                SECTION_TTL,
+                async move { browse::group_items(&session, g).await },
+                |items: Vec<Item>| items.into_iter().map(browse_entry).collect(),
             ),
             Section::Stations => {
                 let api = self.api.clone();

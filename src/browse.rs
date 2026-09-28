@@ -1,221 +1,342 @@
-//! Spotify's own browse content. The Web API dropped browse/categories/featured playlists and
-//! hides Spotify-owned playlists from search, so this reads through the streaming session:
-//! editorial playlists via playlist metadata, a live "popular playlists" list from the mobile
-//! browse hub, and radio stations from the radio-apollo service.
+//! Spotify's own browse content, read the way the official client does: the persisted GraphQL
+//! queries behind "Browse all" on api-partner.spotify.com (undocumented, authorised with the
+//! streaming session's login5 token plus its client token), and radio stations from the
+//! radio-apollo service. The Web API dropped browse/categories and hides Spotify-owned
+//! playlists from search, so this is the only way to reach the full editorial catalogue.
 
-use crate::api::models::Playlist;
-use anyhow::{Result, bail};
-use futures::future::join_all;
-use librespot_core::{Session, SpotifyUri};
-use librespot_metadata::{Metadata, Playlist as MetaPlaylist};
-use reqwest::Method;
-use serde::Deserialize;
+use crate::api::models::{Album, ArtistRef, Playlist};
+use anyhow::{Context, Result, bail};
+use librespot_core::Session;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{sync::LazyLock, time::Duration};
 
+const ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
+const INTEGRATION: &str = "INTEGRATION_WEB_PLAYER";
+const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const BROWSE_ALL: &str = "dbd8b55e09a58afc52eab438bc228ba28fd72ac2f2148c6c26354980e4579001";
+const BROWSE_PAGE: &str = "f5c4e6d668f5716464a231c1cc8b22c1cbf6ad68b09929fd7de813a30581298b";
+const BROWSE_SECTION: &str = "b13c1cccbfcb6947753c2613411b3566485c21fd5f36d80a80bb64be61ba2d51";
+
+/// Shelves per `browsePage` request and items per `browseSection` request.
+const PAGE_STEP: u32 = 10;
+const SECTION_STEP: u32 = 100;
+
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap_or_default()
+});
+
+/// A browse page (`spotify:page:…`): a top-level category such as "Rock", or a sub-page such
+/// as "90s".
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Category {
-    pub name: &'static str,
-    /// Editorial playlist IDs. Names/descriptions are resolved live; IDs that no longer resolve
-    /// are dropped, so a stale entry never breaks the page.
-    pub ids: &'static [&'static str],
+    pub uri: String,
+    pub name: String,
 }
 
-pub const CATEGORIES: &[Category] = &[
-    Category {
-        name: "Charts & New Music",
-        ids: &[
-            "37i9dQZF1DXcBWIGoYBM5M", // Today's Top Hits
-            "37i9dQZEVXbMDoHDwVN2tF", // Top 50 - Global
-            "37i9dQZEVXbLRQDuF5jeBp", // Top 50 - USA
-            "37i9dQZF1DX4JAvHpjipBk", // New Music Friday
-            "37i9dQZF1DX0kbJZpiYdZl", // Hot Hits USA
-            "37i9dQZF1DXbYM3nMM0oPk", // Mega Hit Mix
-        ],
-    },
-    Category {
-        name: "Pop",
-        ids: &[
-            "37i9dQZF1DWUa8ZRTfalHk", // Pop Rising
-            "37i9dQZF1DX4UtSsGT1Sbe", // All Out 80s
-            "37i9dQZF1DXbTxeAdrVG2l", // All Out 90s
-            "37i9dQZF1DX4o1oenSJRJd", // All Out 2000s
-            "37i9dQZF1DX5Ejj0EkURtP", // All Out 2010s
-        ],
-    },
-    Category {
-        name: "Hip-Hop",
-        ids: &[
-            "37i9dQZF1DX0XUsuxWHRQd", // RapCaviar
-            "37i9dQZF1DX2RxBh64BHjQ", // Most Necessary
-            "37i9dQZF1DWY4xHQp97fN6", // Get Turnt
-            "37i9dQZF1DX6GwdWRQMQpq", // Feelin' Myself
-            "37i9dQZF1DX186v583rmzp", // I Love My '90s Hip-Hop
-        ],
-    },
-    Category {
-        name: "R&B",
-        ids: &[
-            "37i9dQZF1DX4SBhb3fqCJd", // RNB X
-            "37i9dQZF1DX6VDO8a6cQME", // I Love My '90s R&B
-            "37i9dQZF1DWXbttAJcbphz", // I Love My '10s R&B
-        ],
-    },
-    Category {
-        name: "Rock & Metal",
-        ids: &[
-            "37i9dQZF1DWXRqgorJj26U", // Rock Classics
-            "37i9dQZF1DX1spT6G94GFC", // 80s Rock Anthems
-            "37i9dQZF1DX1rVvRgjX59F", // 90s Rock Anthems
-            "37i9dQZF1DX3oM43CtKnRV", // 00s Rock Anthems
-            "37i9dQZF1DX9GRpeH4CL0S", // Essential Alternative
-            "37i9dQZF1DXcF6B6QPhFDv", // MARROW
-        ],
-    },
-    Category {
-        name: "Indie",
-        ids: &[
-            "37i9dQZF1DWWEcRhUVtL8n", // Indie Pop
-            "37i9dQZF1DX2Nc3B70tvx0", // Indie's Top 50
-            "37i9dQZF1DX2sUQwD7tbmL", // Feel-Good Indie Rock
-            "37i9dQZF1DXdbXrPNafg9d", // All New Indie
-        ],
-    },
-    Category {
-        name: "Chill & Focus",
-        ids: &[
-            "37i9dQZF1DX4WYpdgoIcn6", // Chill Hits
-            "37i9dQZF1DWWQRwui0ExPn", // lofi beats
-            "37i9dQZF1DX2yvmlOdMYzV", // Lowkey
-            "37i9dQZF1DX4sWSpwq3LiO", // Peaceful Piano
-            "37i9dQZF1DWZeKCadgRdKQ", // Deep Focus
-            "37i9dQZF1DX8NTLI2TtZa6", // Intense Studying
-            "37i9dQZF1DX9sIqqvKsjG8", // Instrumental Study
-        ],
-    },
-    Category {
-        name: "Sleep & Relax",
-        ids: &[
-            "37i9dQZF1DWZd79rJ6a7lp", // Sleep
-            "37i9dQZF1DX3Ogo9pFvBkY", // Ambient Relaxation
-            "37i9dQZF1DWXe9gFZP0gtP", // Stress Relief
-        ],
-    },
-    Category {
-        name: "Workout",
-        ids: &[
-            "37i9dQZF1DX76Wlfdnj7AP", // Beast Mode
-            "37i9dQZF1DXdxcBWuJkbcy", // Gym Hits
-            "37i9dQZF1DX32NsLKyzScr", // Power Hour
-            "37i9dQZF1DWSJHnPb1f0X3", // Cardio
-            "37i9dQZF1DX70RN3TfWWJh", // Workout
-        ],
-    },
-    Category {
-        name: "Party & Mood",
-        ids: &[
-            "37i9dQZF1DXa2PvUpywmrr", // Party Hits
-            "37i9dQZF1DXaXB8fQg7xif", // Dance Party
-            "37i9dQZF1DX3rxVfibe1L0", // Mood Booster
-            "37i9dQZF1DXdPec7aLTmlC", // Happy Hits!
-            "37i9dQZF1DX0BcQWzuB7ZO", // Dance Hits
-        ],
-    },
-    Category {
-        name: "Dance & Electronic",
-        ids: &[
-            "37i9dQZF1DX4dyzvuaRJ0n", // mint
-            "37i9dQZF1DX8tZsk68tuDw", // Dance Rising
-            "37i9dQZF1DXa8NOEUWPn9W", // Housewerk
-            "37i9dQZF1DX0AMssoUKCz7", // Tropical House
-        ],
-    },
-    Category {
-        name: "Country",
-        ids: &[
-            "37i9dQZF1DX1lVhptIYRda", // Hot Country
-            "37i9dQZF1DX13ZzXoot6Jc", // Country Favourites
-        ],
-    },
-    Category {
-        name: "Latin",
-        ids: &[
-            "37i9dQZF1DX10zKzsJ2jva", // Viva Latino
-            "37i9dQZF1DXbLMw3ry7d7k", // Latin Hit Mix
-        ],
-    },
-    Category {
-        name: "Jazz & Classical",
-        ids: &[
-            "37i9dQZF1DWVqfgj8NZEp1", // Coffee Table Jazz
-            "37i9dQZF1DXbITWG1ZJKYt", // Jazz Classics
-            "37i9dQZF1DX0SM0LYsmbMT", // Jazz Vibes
-            "37i9dQZF1DX7YCknf2jT6s", // State of Jazz
-            "37i9dQZF1DWTR4ZOXTfd9K", // Blue Note
-            "37i9dQZF1DWWEJlAGA9gs0", // Classical Essentials
-        ],
-    },
-];
-
-fn playlist(id: &str, name: String, description: String) -> Playlist {
-    Playlist { id: id.to_string(), uri: format!("spotify:playlist:{id}"), name, description }
+/// One shelf on a page ("Rock Classics").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub uri: String,
+    pub title: String,
+    pub total: u32,
+    /// The shelf's contents when the page response carried all of them (always the case for
+    /// "Related content" shelves, which `browseSection` can't serve); empty otherwise.
+    #[serde(default)]
+    pub items: Vec<Item>,
 }
 
-/// Resolve a category's playlists concurrently, keeping catalog order.
-pub async fn category_playlists(session: &Session, cat: &Category) -> Vec<Playlist> {
-    let lookups = cat.ids.iter().map(|id| async move {
-        let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).ok()?;
-        let p = MetaPlaylist::get(session, &uri).await.ok()?;
-        Some(playlist(id, p.attributes.name, p.attributes.description))
-    });
-    join_all(lookups).await.into_iter().flatten().collect()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Item {
+    Playlist(Playlist),
+    Album(Album),
+    Page(Category),
 }
+
+// ---------------------------------------------------------------- wire types
 
 #[derive(Deserialize)]
-struct Hub {
+struct Envelope {
+    data: Option<Value>,
     #[serde(default)]
-    body: Vec<HubItem>,
-}
-
-#[derive(Deserialize)]
-struct HubItem {
-    #[serde(default)]
-    text: HubText,
-    metadata: Option<HubMeta>,
+    errors: Vec<Value>,
 }
 
 #[derive(Deserialize, Default)]
-struct HubText {
+struct Sections {
     #[serde(default)]
-    title: String,
+    items: Vec<WireSection>,
+    #[serde(default, rename = "pagingInfo")]
+    paging: Paging,
+}
+
+#[derive(Deserialize, Default)]
+struct Paging {
+    #[serde(rename = "nextOffset")]
+    next_offset: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WireSection {
+    uri: String,
+    #[serde(default)]
+    data: SectionData,
+    #[serde(rename = "sectionItems")]
+    items: SectionItems,
+}
+
+#[derive(Deserialize, Default)]
+struct SectionData {
+    title: Option<Label>,
+}
+
+#[derive(Deserialize)]
+struct Label {
+    #[serde(default, rename = "transformedLabel")]
+    text: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SectionItems {
+    #[serde(default)]
+    items: Vec<WireItem>,
+    #[serde(default, rename = "totalCount")]
+    total: u32,
+    #[serde(default, rename = "pagingInfo")]
+    paging: Paging,
+}
+
+#[derive(Deserialize)]
+struct WireItem {
+    uri: String,
+    content: Content,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum Content {
+    #[serde(rename = "PlaylistResponseWrapper")]
+    Playlist { data: WirePlaylist },
+    #[serde(rename = "AlbumResponseWrapper")]
+    Album { data: WireAlbum },
+    #[serde(rename = "BrowseSectionContainerWrapper")]
+    Page { data: WirePage },
+    /// Podcasts, audiobooks, links… nothing this client can play.
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+struct WirePlaylist {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     description: String,
 }
 
 #[derive(Deserialize)]
-struct HubMeta {
+struct WireAlbum {
     #[serde(default)]
-    uri: String,
+    name: String,
+    #[serde(default)]
+    artists: WireArtists,
 }
 
-/// Spotify's current popular editorial playlists (undocumented mobile browse hub). Fails soft:
-/// callers show the error and the curated categories keep working.
-pub async fn popular_playlists(session: &Session) -> Result<Vec<Playlist>> {
-    let body = session
-        .spclient()
-        .request_as_json(&Method::GET, "/hubview-mobile-v1/browse?platform=ios&locale=en", None, None)
-        .await?;
-    let hub: Hub = serde_json::from_slice(&body)?;
-    let out: Vec<Playlist> = hub
-        .body
+#[derive(Deserialize, Default)]
+struct WireArtists {
+    #[serde(default)]
+    items: Vec<WireArtist>,
+}
+
+#[derive(Deserialize)]
+struct WireArtist {
+    profile: Option<WireProfile>,
+}
+
+#[derive(Deserialize)]
+struct WireProfile {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct WirePage {
+    data: Option<WireCard>,
+}
+
+#[derive(Deserialize)]
+struct WireCard {
+    #[serde(rename = "cardRepresentation")]
+    card: Option<WireCardRep>,
+}
+
+#[derive(Deserialize)]
+struct WireCardRep {
+    title: Option<Label>,
+}
+
+impl WireItem {
+    fn into_item(self) -> Option<Item> {
+        let uri = self.uri;
+        match self.content {
+            Content::Playlist { data } => {
+                let id = uri.strip_prefix("spotify:playlist:")?.to_string();
+                Some(Item::Playlist(Playlist { id, uri, name: data.name, description: data.description }))
+            }
+            Content::Album { data } => {
+                let id = uri.strip_prefix("spotify:album:")?.to_string();
+                let artists = data
+                    .artists
+                    .items
+                    .into_iter()
+                    .filter_map(|a| a.profile)
+                    .map(|p| ArtistRef { name: p.name })
+                    .collect();
+                Some(Item::Album(Album { id, uri, name: data.name, artists }))
+            }
+            Content::Page { data } => {
+                if !uri.starts_with("spotify:page:") {
+                    return None;
+                }
+                let name = data.data?.card?.title?.text;
+                Some(Item::Page(Category { uri, name }))
+            }
+            Content::Unsupported => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- transport
+
+/// One persisted query. Returns the `data` object; GraphQL errors without data are failures.
+async fn query(session: &Session, operation: &str, hash: &str, mut variables: Value) -> Result<Value> {
+    variables["browseEndUserIntegration"] = json!(INTEGRATION);
+    variables["includeEpisodeContentRatingsV2"] = json!(true);
+    let body = json!({
+        "variables": variables,
+        "operationName": operation,
+        "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } },
+    });
+
+    let token = session.login5().auth_token().await.context("login5 token")?;
+    let client_token = session.spclient().client_token().await.context("client token")?;
+    let resp = HTTP
+        .post(ENDPOINT)
+        .header("authorization", format!("Bearer {}", token.access_token))
+        .header("client-token", client_token)
+        .header("app-platform", "WebPlayer")
+        .header("accept", "application/json")
+        .header("user-agent", USER_AGENT)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("{operation} request"))?;
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        bail!("{operation}: HTTP {status}");
+    }
+    let env: Envelope = serde_json::from_slice(&bytes).with_context(|| format!("{operation} response"))?;
+    match env.data {
+        Some(d) => Ok(d),
+        None => bail!("{operation}: {}", env.errors.first().map_or("no data".into(), Value::to_string)),
+    }
+}
+
+/// Deserialize `data.<key>.sections`.
+fn sections_at(mut data: Value, key: &str) -> Result<Sections> {
+    let node = data.get_mut(key).and_then(|c| c.get_mut("sections")).map(Value::take);
+    let node = node.with_context(|| format!("response has no {key}.sections"))?;
+    Ok(serde_json::from_value(node)?)
+}
+
+// ---------------------------------------------------------------- browse
+
+/// The live "Browse all" catalogue: every top-level category, in Spotify's order.
+pub async fn categories(session: &Session) -> Result<Vec<Category>> {
+    let vars = json!({
+        "pagePagination": { "offset": 0, "limit": PAGE_STEP },
+        "sectionPagination": { "offset": 0, "limit": 99 },
+    });
+    let data = query(session, "browseAll", BROWSE_ALL, vars).await?;
+    let out: Vec<Category> = sections_at(data, "browseStart")?
+        .items
         .into_iter()
-        .filter_map(|i| {
-            let uri = i.metadata?.uri;
-            let id = uri.strip_prefix("spotify:playlist:")?.to_string();
-            Some(playlist(&id, i.text.title, i.text.description))
+        .flat_map(|s| s.items.items)
+        .filter_map(WireItem::into_item)
+        .filter_map(|i| match i {
+            Item::Page(c) => Some(c),
+            _ => None,
         })
         .collect();
     if out.is_empty() {
-        bail!("browse hub returned no playlists");
+        bail!("Browse all returned no categories");
     }
     Ok(out)
+}
+
+/// Every shelf of a page. Empty shelves are dropped.
+pub async fn page_groups(session: &Session, page_uri: &str) -> Result<Vec<Group>> {
+    let mut groups = Vec::new();
+    let mut offset = 0;
+    loop {
+        let vars = json!({
+            "uri": page_uri,
+            "pagePagination": { "offset": offset, "limit": PAGE_STEP },
+            // Spotify caps this at 50; longer shelves are completed by `group_items`.
+            "sectionPagination": { "offset": 0, "limit": 50 },
+        });
+        let data = query(session, "browsePage", BROWSE_PAGE, vars).await?;
+        let sections = sections_at(data, "browse")?;
+        for s in sections.items {
+            let total = s.items.total;
+            let complete = s.items.items.len() as u32 >= total;
+            let items: Vec<Item> = s.items.items.into_iter().filter_map(WireItem::into_item).collect();
+            // Nothing this client can play (podcasts, audiobooks…).
+            if total == 0 || (complete && items.is_empty()) {
+                continue;
+            }
+            let items = if complete { items } else { Vec::new() };
+            groups.push(Group { title: s.data.title.map_or_else(String::new, |t| t.text), uri: s.uri, total, items });
+        }
+        match sections.paging.next_offset {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+    if groups.is_empty() {
+        bail!("page has no playlists or albums");
+    }
+    Ok(groups)
+}
+
+/// Everything on one shelf: what the page already carried, else paged in from `browseSection`.
+pub async fn group_items(session: &Session, group: Group) -> Result<Vec<Item>> {
+    if !group.items.is_empty() {
+        return Ok(group.items);
+    }
+    let section_uri = &group.uri;
+    let mut items = Vec::new();
+    let mut offset = 0;
+    loop {
+        let vars = json!({
+            "uri": section_uri,
+            "pagination": { "offset": offset, "limit": SECTION_STEP },
+        });
+        let mut data = query(session, "browseSection", BROWSE_SECTION, vars).await?;
+        let node = data.get_mut("browseSection").and_then(|s| s.get_mut("sectionItems")).map(Value::take);
+        let node: SectionItems = serde_json::from_value(node.context("response has no browseSection")?)?;
+        items.extend(node.items.into_iter().filter_map(WireItem::into_item));
+        match node.paging.next_offset {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+    if items.is_empty() {
+        bail!("shelf has no playlists or albums");
+    }
+    Ok(items)
 }
 
 #[derive(Deserialize)]
