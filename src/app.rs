@@ -1,4 +1,5 @@
 use crate::api::{
+    HttpError,
     Api,
     models::{Album, Artist, Playlist, SearchResults, Track},
 };
@@ -542,14 +543,20 @@ impl App {
 
     fn open_playlist(&mut self, id: String, uri: String, name: String, push: bool) {
         let load = self.new_load();
-        let list = View::Tracks(TrackList::new(name, load, Some(uri)));
+        let list = View::Tracks(TrackList::new(name, load, Some(uri.clone())));
         if push {
             self.push_view(list);
         } else {
             self.view = Some(list);
         }
-        let api = self.api.clone();
-        self.spawn_tracks(load, move |on| async move { api.playlist_tracks(&id, on).await });
+        let (api, player) = (self.api.clone(), self.player.clone());
+        self.spawn_tracks(load, move |mut on| async move {
+            match api.playlist_tracks(&id, &mut on).await {
+                // Web API only serves playlists you own; use the streaming session for the rest.
+                Err(e) if HttpError::is_forbidden(&e) => player.playlist_tracks(&uri, on).await,
+                res => res,
+            }
+        });
     }
 
     fn open_album(&mut self, a: &Album) {

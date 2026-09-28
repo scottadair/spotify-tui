@@ -2,7 +2,11 @@
 //! player events, so the UI never polls the Web API.
 
 use crate::config::{Config, LIBRESPOT_CLIENT_ID, LIBRESPOT_REDIRECT, Paths};
+use crate::api::models::{AlbumRef, ArtistRef, Track as ApiTrack};
 use anyhow::{Context, Result};
+use futures::{StreamExt, future::join_all, stream};
+use librespot_core::SpotifyUri;
+use librespot_metadata::{Metadata, Playlist as MetaPlaylist, Track as MetaTrack};
 use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
 use librespot_core::{Session, SessionConfig, authentication::Credentials, cache::Cache};
 use librespot_metadata::audio::UniqueFields;
@@ -46,6 +50,7 @@ pub enum PlaybackEvent {
 pub struct PlayerHandle {
     spirc: Arc<Spirc>,
     mixer: Arc<SoftMixer>,
+    session: Session,
 }
 
 const STREAM_SCOPES: &[&str] = &[
@@ -129,12 +134,13 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
         initial_volume: volume,
         ..Default::default()
     };
+    let handle_session = session.clone();
     let (spirc, task) = Spirc::new(connect_cfg, session, creds, player, mixer.clone())
         .await
         .context("connecting to Spotify (delete the librespot cache dir to re-authorise)")?;
     tokio::spawn(task);
 
-    Ok(Started { handle: PlayerHandle { spirc: Arc::new(spirc), mixer }, volume })
+    Ok(Started { handle: PlayerHandle { spirc: Arc::new(spirc), mixer, session: handle_session }, volume })
 }
 
 fn map_event(ev: PlayerEvent) -> Option<PlaybackEvent> {
@@ -173,6 +179,31 @@ fn map_event(ev: PlayerEvent) -> Option<PlaybackEvent> {
 }
 
 impl PlayerHandle {
+    /// Load a playlist's tracks through the streaming session's metadata endpoints. Unlike the
+    /// Web API (owned playlists only since Feb 2026) this works for any playlist you can open.
+    pub async fn playlist_tracks(
+        &self,
+        uri: &str,
+        mut on_chunk: impl FnMut(Vec<ApiTrack>, u32),
+    ) -> Result<()> {
+        let uri = SpotifyUri::from_uri(uri)?;
+        let list = MetaPlaylist::get(&self.session, &uri).await?;
+        let ids: Vec<SpotifyUri> = list
+            .tracks()
+            .filter(|u| matches!(u, SpotifyUri::Track { .. }))
+            .cloned()
+            .collect();
+        let total = ids.len() as u32;
+        let session = &self.session;
+        let owned: Vec<Vec<SpotifyUri>> = ids.chunks(20).map(<[_]>::to_vec).collect();
+        let mut chunks = stream::iter(owned).map(|c| fetch_chunk(session, c)).buffered(4);
+        while let Some(results) = chunks.next().await {
+            let tracks = results.into_iter().flatten().filter_map(to_api_track).collect();
+            on_chunk(tracks, total);
+        }
+        Ok(())
+    }
+
     pub fn play_pause(&self) {
         let _ = self.spirc.play_pause();
     }
@@ -222,4 +253,18 @@ impl PlayerHandle {
     pub fn shutdown(&self) {
         let _ = self.spirc.shutdown();
     }
+}
+
+fn to_api_track(t: MetaTrack) -> Option<ApiTrack> {
+    Some(ApiTrack {
+        uri: t.id.to_uri().ok()?,
+        name: t.name,
+        artists: t.artists.iter().map(|a| ArtistRef { name: a.name.clone() }).collect(),
+        album: Some(AlbumRef { name: t.album.name }),
+        duration_ms: t.duration.max(0) as u32,
+    })
+}
+
+async fn fetch_chunk(session: &Session, ids: Vec<SpotifyUri>) -> Vec<Result<MetaTrack, librespot_core::Error>> {
+    join_all(ids.iter().map(|id| MetaTrack::get(session, id))).await
 }

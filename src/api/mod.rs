@@ -12,6 +12,28 @@ const BASE: &str = "https://api.spotify.com/v1";
 const PAGE: u32 = 50;
 const CONCURRENCY: usize = 4;
 
+/// Non-success HTTP response, kept typed so callers can react to specific statuses.
+#[derive(Debug)]
+pub struct HttpError {
+    pub path: String,
+    pub status: StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GET {} failed: {} {}", self.path, self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl HttpError {
+    pub fn is_forbidden(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<HttpError>().is_some_and(|h| h.status == StatusCode::FORBIDDEN)
+    }
+}
+
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -49,7 +71,8 @@ impl Api {
                 }
                 s => {
                     let body = resp.text().await.unwrap_or_default();
-                    bail!("GET {path} failed: {s} {}", body.chars().take(200).collect::<String>());
+                    let msg = body.chars().take(200).collect::<String>();
+                    return Err(HttpError { path: path.to_string(), status: s, body: msg }.into());
                 }
             }
         }
