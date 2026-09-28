@@ -1,19 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// librespot's public client id. Streaming logins must use it.
+/// librespot's public client id. The streaming session must be authorised by it. It is
+/// heavily rate limited on the Web API, so it is only used for streaming.
 pub const LIBRESPOT_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 pub const LIBRESPOT_REDIRECT: &str = "http://127.0.0.1:8898/login";
-pub const CUSTOM_REDIRECT: &str = "http://127.0.0.1:8888/callback";
+pub const REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Optional: client ID of your own app (https://developer.spotify.com/dashboard, redirect
-    /// URI http://127.0.0.1:8888/callback) for Web API calls with your own rate limits.
-    /// Empty = use the same login as the streaming device (single sign-in).
+    /// Client ID of your own Spotify app (required; used for all Web API calls).
     pub client_id: String,
     /// Name shown in Spotify Connect device lists.
     pub device_name: String,
@@ -62,26 +61,26 @@ impl Paths {
 }
 
 impl Config {
-    /// Load the config file; a missing file means all defaults.
+    /// Load the config file. `client_id` is required for Web API access.
     pub fn load(paths: &Paths) -> Result<Self> {
         if !paths.config_file.exists() {
-            return Ok(Self::default());
+            if let Some(parent) = paths.config_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&paths.config_file, toml::to_string_pretty(&Config::default())?)?;
         }
         let text = std::fs::read_to_string(&paths.config_file)?;
-        toml::from_str(&text).with_context(|| format!("invalid config {}", paths.config_file.display()))
-    }
-
-    /// (client id, redirect URI) used for Web API auth.
-    pub fn oauth_client(&self) -> (&str, &str) {
-        let id = self.client_id.trim();
-        if id.is_empty() {
-            (LIBRESPOT_CLIENT_ID, LIBRESPOT_REDIRECT)
-        } else {
-            (id, CUSTOM_REDIRECT)
+        let cfg: Config = toml::from_str(&text)
+            .with_context(|| format!("invalid config {}", paths.config_file.display()))?;
+        if cfg.client_id.trim().is_empty() {
+            bail!(
+                "Set `client_id` in {}\n\
+                 1. Create an app at https://developer.spotify.com/dashboard\n\
+                 2. Add redirect URI: {REDIRECT_URI}\n\
+                 3. Copy its Client ID into the config file and re-run.",
+                paths.config_file.display()
+            );
         }
-    }
-
-    pub fn uses_default_client(&self) -> bool {
-        self.client_id.trim().is_empty()
+        Ok(cfg)
     }
 }

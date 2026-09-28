@@ -198,7 +198,9 @@ impl App {
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
-        self.status = Some((msg.into(), Instant::now()));
+        let msg = msg.into();
+        tracing::warn!("{msg}");
+        self.status = Some((msg, Instant::now()));
         self.dirty = true;
     }
 

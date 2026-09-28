@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
 
     let (pb_tx, mut pb_rx) = mpsc::unbounded_channel();
     println!("Connecting to Spotify...");
-    let started = player::start(&cfg, &paths, &auth, pb_tx).await?;
+    let started = player::start(&cfg, &paths, pb_tx).await?;
     {
         let tx = tx.clone();
         tokio::spawn(async move {

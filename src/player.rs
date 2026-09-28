@@ -1,7 +1,6 @@
 //! Embedded Spotify Connect device (librespot). Playback state is driven purely by
 //! player events, so the UI never polls the Web API.
 
-use crate::auth::{STREAM_SCOPES, WebAuth};
 use crate::config::{Config, LIBRESPOT_CLIENT_ID, LIBRESPOT_REDIRECT, Paths};
 use anyhow::{Context, Result};
 use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
@@ -49,15 +48,19 @@ pub struct PlayerHandle {
     mixer: Arc<SoftMixer>,
 }
 
-/// Credentials from cache; else the already-authorised Web API token (default client id, no
-/// extra login); else a separate interactive login (custom client id only).
-/// Must run before the TUI starts.
-async fn credentials(cache: &Cache, cfg: &Config, auth: &WebAuth) -> Result<Credentials> {
+const STREAM_SCOPES: &[&str] = &[
+    "streaming",
+    "app-remote-control",
+    "user-read-playback-state",
+    "user-modify-playback-state",
+    "user-read-currently-playing",
+];
+
+/// Credentials from cache, else a one-time interactive login with librespot's client id
+/// (the streaming session only accepts tokens from it). Must run before the TUI starts.
+async fn credentials(cache: &Cache) -> Result<Credentials> {
     if let Some(c) = cache.credentials() {
         return Ok(c);
-    }
-    if cfg.uses_default_client() {
-        return Ok(Credentials::with_access_token(auth.access_token().await?));
     }
     println!("Authorising the streaming device (one-time)...");
     let token = OAuthClientBuilder::new(LIBRESPOT_CLIENT_ID, LIBRESPOT_REDIRECT, STREAM_SCOPES.to_vec())
@@ -77,19 +80,14 @@ pub struct Started {
     pub volume: u16,
 }
 
-pub async fn start(
-    cfg: &Config,
-    paths: &Paths,
-    auth: &WebAuth,
-    events: UnboundedSender<PlaybackEvent>,
-) -> Result<Started> {
+pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<PlaybackEvent>) -> Result<Started> {
     let cache = Cache::new(
         Some(paths.librespot_cache()),
         Some(paths.librespot_cache()),
         None,
         None,
     )?;
-    let creds = credentials(&cache, cfg, auth).await?;
+    let creds = credentials(&cache).await?;
 
     let session = Session::new(SessionConfig::default(), Some(cache.clone()));
 

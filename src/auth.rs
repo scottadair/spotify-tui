@@ -1,6 +1,6 @@
 //! Spotify Web API auth: PKCE (via librespot-oauth) with a cached, auto-refreshed token.
 
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, REDIRECT_URI};
 use anyhow::{Context, Result};
 use librespot_oauth::{OAuthClient, OAuthClientBuilder, OAuthToken};
 use serde::{Deserialize, Serialize};
@@ -22,15 +22,6 @@ const SCOPES: &[&str] = &[
     "user-top-read",
     "user-read-recently-played",
     "user-read-private",
-];
-
-/// Extra scopes for the streaming device; only valid with librespot's client id.
-pub const STREAM_SCOPES: &[&str] = &[
-    "streaming",
-    "app-remote-control",
-    "user-read-playback-state",
-    "user-modify-playback-state",
-    "user-read-currently-playing",
 ];
 
 /// Refresh this long before actual expiry.
@@ -60,13 +51,8 @@ impl WebAuth {
     /// Use the cached refresh token if it works, otherwise run the interactive browser flow.
     /// Must run before the TUI starts (prints the URL to stdout).
     pub async fn login(cfg: &Config, paths: &Paths) -> Result<Self> {
-        let (client_id, redirect) = cfg.oauth_client();
-        let mut scopes = SCOPES.to_vec();
-        if cfg.uses_default_client() {
-            // Same token also authorises the streaming device.
-            scopes.extend_from_slice(STREAM_SCOPES);
-        }
-        let oauth = OAuthClientBuilder::new(client_id, redirect, scopes)
+        let client_id = cfg.client_id.trim();
+        let oauth = OAuthClientBuilder::new(client_id, REDIRECT_URI, SCOPES.to_vec())
             .open_in_browser()
             .with_custom_message("Logged in to spotify-tui. You can close this tab.")
             .build()
