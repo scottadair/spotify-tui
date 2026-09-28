@@ -1,6 +1,6 @@
 //! Web API response types. Deliberately tolerant: post-2026 responses drop many fields.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct Page<T> {
@@ -10,19 +10,19 @@ pub struct Page<T> {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArtistRef {
     #[serde(default)]
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AlbumRef {
     #[serde(default)]
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track {
     #[serde(default)]
     pub uri: String,
@@ -63,14 +63,16 @@ pub struct PlaylistItem {
     pub item: Option<Track>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,
     pub uri: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Album {
     pub id: String,
     pub uri: String,
@@ -79,7 +81,7 @@ pub struct Album {
     pub artists: Vec<ArtistRef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artist {
     pub uri: String,
     pub name: String,

@@ -257,6 +257,11 @@ impl PlayerHandle {
         self.load(LoadRequest::from_tracks(uris, Self::opts(index)));
     }
 
+    /// The streaming session, for metadata/browse endpoints the Web API no longer serves.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     pub fn shutdown(&self) {
         let _ = self.spirc.shutdown();
     }

@@ -1,18 +1,26 @@
 use crate::api::{
-    HttpError,
-    Api,
+    Api, HttpError,
     models::{Album, Artist, Playlist, SearchResults, Track},
 };
+use crate::browse::{self, Category};
+use crate::cache::Cache;
 use crate::event::{Data, Event};
 use crate::player::{PlaybackEvent, PlayerHandle, TrackInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const VOLUME_STEP: u16 = u16::MAX / 20;
 const SEEK_STEP_MS: u32 = 5_000;
 const STATUS_TTL: Duration = Duration::from_secs(5);
+
+/// Cached track lists newer than this are shown without touching the network.
+const TRACKS_FRESH: Duration = Duration::from_secs(5 * 60);
+const POPULAR_TTL: Duration = Duration::from_secs(60 * 60);
+const CATEGORY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const TOP_ARTISTS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 // ---------------------------------------------------------------- views
 
@@ -28,10 +36,14 @@ pub struct TrackList {
     /// Context URI (album/playlist) whose item order matches `tracks` exactly, if any.
     pub context: Option<String>,
     pub state: TableState,
+    /// Disk cache key; `None` for lists that must always be live.
+    cache_key: Option<String>,
+    /// `tracks` currently hold cached content that the first live chunk replaces.
+    from_cache: bool,
 }
 
 impl TrackList {
-    fn new(title: String, load: u64, context: Option<String>) -> Self {
+    fn new(title: String, load: u64, context: Option<String>, cache_key: Option<String>) -> Self {
         Self {
             title,
             tracks: Vec::new(),
@@ -41,6 +53,38 @@ impl TrackList {
             load,
             context,
             state: TableState::default(),
+            cache_key,
+            from_cache: false,
+        }
+    }
+}
+
+/// Persisted form of a fully loaded track list.
+#[derive(Serialize, Deserialize)]
+pub struct TrackCache {
+    tracks: Vec<Track>,
+    total: u32,
+    skipped: u32,
+}
+
+/// A page under Browse.
+#[derive(Clone, Copy)]
+pub enum Section {
+    /// Spotify's live popular playlists.
+    Popular,
+    Category(&'static Category),
+    /// Radio stations seeded by your top artists.
+    Stations,
+    Recent,
+}
+
+impl Section {
+    pub fn label(&self) -> &str {
+        match self {
+            Section::Popular => "Popular Playlists",
+            Section::Category(c) => c.name,
+            Section::Stations => "Radio Stations (from your top artists)",
+            Section::Recent => "Recently Played",
         }
     }
 }
@@ -51,6 +95,9 @@ pub enum Entry {
     Album(Album),
     Artist(Artist),
     Playlist(Playlist),
+    Section(Section),
+    /// Radio seeded by an artist or track URI.
+    Station { name: String, seed: String },
 }
 
 pub struct SearchState {
@@ -65,6 +112,18 @@ pub struct EntryList {
     pub state: ListState,
     pub search: Option<SearchState>,
     pub loading: bool,
+    /// Load id for asynchronously filled lists (0 = not applicable).
+    pub load: u64,
+}
+
+impl EntryList {
+    fn new(title: impl Into<String>, entries: Vec<Entry>, loading: bool, load: u64) -> Self {
+        let mut state = ListState::default();
+        if !entries.is_empty() {
+            state.select(Some(0));
+        }
+        Self { title: title.into(), entries, state, search: None, loading, load }
+    }
 }
 
 pub enum View {
@@ -72,8 +131,12 @@ pub enum View {
     Entries(EntryList),
 }
 
+/// Sidebar rows before the user's playlists start.
+pub const FIXED_SIDEBAR_ITEMS: usize = 4;
+
 pub enum SidebarItem {
     Search,
+    Browse,
     Liked,
     Albums,
     Playlist(Playlist),
@@ -83,6 +146,7 @@ impl SidebarItem {
     pub fn label(&self) -> &str {
         match self {
             SidebarItem::Search => "Search",
+            SidebarItem::Browse => "Browse",
             SidebarItem::Liked => "Liked Songs",
             SidebarItem::Albums => "Saved Albums",
             SidebarItem::Playlist(p) => &p.name,
@@ -145,6 +209,7 @@ impl Now {
 pub struct App {
     api: Api,
     player: PlayerHandle,
+    cache: Cache,
     tx: UnboundedSender<Event>,
 
     pub sidebar: Vec<SidebarItem>,
@@ -165,13 +230,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(api: Api, player: PlayerHandle, tx: UnboundedSender<Event>, volume: u16) -> Self {
+    pub fn new(api: Api, player: PlayerHandle, cache: Cache, tx: UnboundedSender<Event>, volume: u16) -> Self {
         let mut app = Self {
             api,
             player,
+            cache,
             tx,
-            sidebar: vec![SidebarItem::Search, SidebarItem::Liked, SidebarItem::Albums],
-            sidebar_state: ListState::default().with_selected(Some(1)),
+            sidebar: vec![
+                SidebarItem::Search,
+                SidebarItem::Browse,
+                SidebarItem::Liked,
+                SidebarItem::Albums,
+            ],
+            sidebar_state: ListState::default().with_selected(Some(2)),
             focus: Focus::Sidebar,
             view: None,
             back: Vec::new(),
@@ -261,7 +332,7 @@ impl App {
         self.dirty = true;
         match d {
             Data::Playlists(Ok(list)) => {
-                self.sidebar.truncate(3);
+                self.sidebar.truncate(FIXED_SIDEBAR_ITEMS);
                 self.sidebar.extend(list.into_iter().map(SidebarItem::Playlist));
             }
             Data::Playlists(Err(e)) => self.toast(format!("Playlists: {e:#}")),
@@ -281,26 +352,81 @@ impl App {
                     }
                 }
             }
+            Data::CachedTracks { load, cache, fresh } => {
+                if let Some(l) = self.track_list_mut(load) {
+                    // Only paint cache into an untouched list; live data may have won the race.
+                    if l.tracks.is_empty() {
+                        l.tracks = cache.tracks;
+                        l.total = cache.total;
+                        l.skipped = cache.skipped;
+                        l.from_cache = !fresh;
+                        if !l.tracks.is_empty() {
+                            l.state.select(Some(0));
+                        }
+                    }
+                    if fresh {
+                        l.loading = false;
+                    }
+                }
+            }
             Data::TrackChunk { load, tracks, total } => {
                 if let Some(l) = self.track_list_mut(load) {
+                    if l.from_cache {
+                        // First live data replaces the cached copy; keep the cursor where it was.
+                        l.from_cache = false;
+                        l.tracks.clear();
+                        l.skipped = 0;
+                    }
                     l.total = total;
                     let before = l.tracks.len();
                     let n = tracks.len();
                     l.tracks.extend(tracks.into_iter().filter(Track::is_playable_track));
                     l.skipped += (n - (l.tracks.len() - before)) as u32;
-                    if before == 0 && !l.tracks.is_empty() {
+                    if l.state.selected().is_none() && !l.tracks.is_empty() {
                         l.state.select(Some(0));
                     }
                 }
             }
             Data::TrackLoadDone { load, error } => {
+                let mut to_cache = None;
                 if let Some(l) = self.track_list_mut(load) {
                     l.loading = false;
+                    if error.is_some() && l.from_cache {
+                        // Live load failed; the cached copy stays on screen.
+                        l.from_cache = false;
+                    } else if error.is_none() {
+                        to_cache = l.cache_key.clone().map(|k| {
+                            (k, TrackCache { tracks: l.tracks.clone(), total: l.total, skipped: l.skipped })
+                        });
+                    }
+                }
+                if let Some((key, data)) = to_cache {
+                    let cache = self.cache.clone();
+                    tokio::spawn(async move { cache.write(&key, data).await });
                 }
                 if let Some(e) = error {
                     self.toast(format!("Load failed: {e}"));
                 }
             }
+            Data::Entries { load, result } => {
+                if let Some(l) = self.entry_list_mut(load) {
+                    l.loading = false;
+                    if let Ok(entries) = &result {
+                        l.entries = entries.clone();
+                        l.state.select(if l.entries.is_empty() { None } else { Some(0) });
+                    }
+                }
+                if let Err(e) = result {
+                    self.toast(format!("Load failed: {e:#}"));
+                }
+            }
+            Data::Station { name, result } => match result {
+                Ok(uris) => {
+                    self.player.play_tracks(uris, 0);
+                    self.toast(format!("Playing {name} radio"));
+                }
+                Err(e) => self.toast(format!("Radio: {e:#}")),
+            },
             Data::Search { seq, result } => {
                 if let Some(View::Entries(l)) = &mut self.view {
                     if matches!(&l.search, Some(s) if s.seq == seq) {
@@ -320,13 +446,17 @@ impl App {
 
     /// Find the track list (current view or navigation stack) for a load id.
     fn track_list_mut(&mut self, load: u64) -> Option<&mut TrackList> {
-        self.view
-            .iter_mut()
-            .chain(self.back.iter_mut())
-            .find_map(|v| match v {
-                View::Tracks(l) if l.load == load => Some(l),
-                _ => None,
-            })
+        self.view.iter_mut().chain(self.back.iter_mut()).find_map(|v| match v {
+            View::Tracks(l) if l.load == load => Some(l),
+            _ => None,
+        })
+    }
+
+    fn entry_list_mut(&mut self, load: u64) -> Option<&mut EntryList> {
+        self.view.iter_mut().chain(self.back.iter_mut()).find_map(|v| match v {
+            View::Entries(l) if l.load == load => Some(l),
+            _ => None,
+        })
     }
 
     // ------------------------------------------------------------ keys
@@ -354,6 +484,7 @@ impl App {
             KeyCode::Char('p') => self.player.prev(),
             KeyCode::Char('s') => self.player.shuffle(!self.now.shuffle),
             KeyCode::Char('r') => self.player.repeat(self.now.repeat_ctx, self.now.repeat_track),
+            KeyCode::Char('R') => self.start_radio(),
             KeyCode::Char('+' | '=') => self.change_volume(true),
             KeyCode::Char('-') => self.change_volume(false),
             KeyCode::Char('>') => self.seek(true),
@@ -507,28 +638,25 @@ impl App {
         self.view = None;
         match &self.sidebar[i] {
             SidebarItem::Search => {
-                self.view = Some(View::Entries(EntryList {
-                    title: "Search".into(),
-                    entries: Vec::new(),
-                    state: ListState::default(),
-                    search: Some(SearchState { query: String::new(), editing: false, seq: 0 }),
-                    loading: false,
-                }));
+                let mut list = EntryList::new("Search", Vec::new(), false, 0);
+                list.search = Some(SearchState { query: String::new(), editing: false, seq: 0 });
+                self.view = Some(View::Entries(list));
+            }
+            SidebarItem::Browse => {
+                let mut entries = vec![Entry::Section(Section::Popular)];
+                entries.extend(browse::CATEGORIES.iter().map(|c| Entry::Section(Section::Category(c))));
+                entries.push(Entry::Section(Section::Stations));
+                entries.push(Entry::Section(Section::Recent));
+                self.view = Some(View::Entries(EntryList::new("Browse", entries, false, 0)));
             }
             SidebarItem::Liked => {
                 let load = self.new_load();
-                self.view = Some(View::Tracks(TrackList::new("Liked Songs".into(), load, None)));
+                self.view = Some(View::Tracks(TrackList::new("Liked Songs".into(), load, None, Some("liked".into()))));
                 let api = self.api.clone();
                 self.spawn_tracks(load, move |on| async move { api.saved_tracks(on).await });
             }
             SidebarItem::Albums => {
-                self.view = Some(View::Entries(EntryList {
-                    title: "Saved Albums".into(),
-                    entries: Vec::new(),
-                    state: ListState::default(),
-                    search: None,
-                    loading: true,
-                }));
+                self.view = Some(View::Entries(EntryList::new("Saved Albums", Vec::new(), true, 0)));
                 let (api, tx) = (self.api.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     let _ = tx.send(Event::Data(Data::Albums(api.saved_albums().await)));
@@ -541,9 +669,98 @@ impl App {
         }
     }
 
+    fn open_section(&mut self, section: Section) {
+        if let Section::Recent = section {
+            // Always live: recency is the whole point.
+            let load = self.new_load();
+            self.push_view(View::Tracks(TrackList::new(section.label().into(), load, None, None)));
+            let api = self.api.clone();
+            self.spawn_tracks(load, move |on| async move { api.recently_played(on).await });
+            return;
+        }
+        let load = self.new_load();
+        self.push_view(View::Entries(EntryList::new(section.label(), Vec::new(), true, load)));
+        let session = self.player.session().clone();
+        match section {
+            Section::Popular => self.spawn_entries(
+                load,
+                "browse-popular".into(),
+                POPULAR_TTL,
+                async move { browse::popular_playlists(&session).await },
+                |items: Vec<Playlist>| items.into_iter().map(Entry::Playlist).collect(),
+            ),
+            Section::Category(c) => self.spawn_entries(
+                load,
+                format!("browse-cat-{}", c.name),
+                CATEGORY_TTL,
+                async move {
+                    let items = browse::category_playlists(&session, c).await;
+                    // An empty result means lookups failed; don't cache or show a blank page.
+                    if items.is_empty() {
+                        anyhow::bail!("no playlists resolved for {}", c.name);
+                    }
+                    Ok(items)
+                },
+                |items: Vec<Playlist>| items.into_iter().map(Entry::Playlist).collect(),
+            ),
+            Section::Stations => {
+                let api = self.api.clone();
+                self.spawn_entries(
+                    load,
+                    "top-artists".into(),
+                    TOP_ARTISTS_TTL,
+                    async move { api.top_artists().await },
+                    |items: Vec<Artist>| {
+                        items.into_iter().map(|a| Entry::Station { name: a.name, seed: a.uri }).collect()
+                    },
+                );
+            }
+            Section::Recent => {}
+        }
+    }
+
+    /// Fill an entry list from the disk cache when fresh; otherwise fetch, then cache. If the
+    /// fetch fails, an expired cache entry is better than an error page.
+    fn spawn_entries<T, Fut>(
+        &self,
+        load: u64,
+        key: String,
+        ttl: Duration,
+        fetch: Fut,
+        wrap: fn(Vec<T>) -> Vec<Entry>,
+    ) where
+        T: Serialize + DeserializeOwned + Clone + Send + 'static,
+        Fut: Future<Output = anyhow::Result<Vec<T>>> + Send + 'static,
+    {
+        let (cache, tx) = (self.cache.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let cached = cache.read::<Vec<T>>(&key).await;
+            if let Some(c) = &cached {
+                if c.age < ttl {
+                    let _ = tx.send(Event::Data(Data::Entries { load, result: Ok(wrap(c.data.clone())) }));
+                    return;
+                }
+            }
+            let result = match fetch.await {
+                Ok(items) => {
+                    cache.write(&key, items.clone()).await;
+                    Ok(wrap(items))
+                }
+                Err(e) => match cached {
+                    Some(c) => {
+                        tracing::warn!("refresh of {key} failed, using stale cache: {e:#}");
+                        Ok(wrap(c.data))
+                    }
+                    None => Err(e),
+                },
+            };
+            let _ = tx.send(Event::Data(Data::Entries { load, result }));
+        });
+    }
+
     fn open_playlist(&mut self, id: String, uri: String, name: String, push: bool) {
         let load = self.new_load();
-        let list = View::Tracks(TrackList::new(name, load, Some(uri.clone())));
+        let list = View::Tracks(TrackList::new(name, load, Some(uri.clone()), Some(format!("playlist-{id}"))));
         if push {
             self.push_view(list);
         } else {
@@ -561,7 +778,12 @@ impl App {
 
     fn open_album(&mut self, a: &Album) {
         let load = self.new_load();
-        self.push_view(View::Tracks(TrackList::new(a.name.clone(), load, Some(a.uri.clone()))));
+        self.push_view(View::Tracks(TrackList::new(
+            a.name.clone(),
+            load,
+            Some(a.uri.clone()),
+            Some(format!("album-{}", a.id)),
+        )));
         let (api, id, name) = (self.api.clone(), a.id.clone(), a.name.clone());
         self.spawn_tracks(load, move |on| async move { api.album_tracks(&id, &name, on).await });
     }
@@ -571,21 +793,55 @@ impl App {
         self.next_load
     }
 
+    /// Show cached playlists immediately, then refresh them.
     fn spawn_playlists(&self) {
-        let (api, tx) = (self.api.clone(), self.tx.clone());
+        const KEY: &str = "my-playlists";
+        let (api, tx, cache) = (self.api.clone(), self.tx.clone(), self.cache.clone());
         tokio::spawn(async move {
-            let _ = tx.send(Event::Data(Data::Playlists(api.my_playlists().await)));
+            let cached = cache.read::<Vec<Playlist>>(KEY).await;
+            let had_cache = cached.is_some();
+            if let Some(c) = cached {
+                let _ = tx.send(Event::Data(Data::Playlists(Ok(c.data))));
+            }
+            match api.my_playlists().await {
+                Ok(list) => {
+                    cache.write(KEY, list.clone()).await;
+                    let _ = tx.send(Event::Data(Data::Playlists(Ok(list))));
+                }
+                // A failed refresh only matters if there was nothing to show.
+                Err(e) if !had_cache => {
+                    let _ = tx.send(Event::Data(Data::Playlists(Err(e))));
+                }
+                Err(e) => tracing::warn!("playlist refresh failed: {e:#}"),
+            }
         });
     }
 
-    /// Run a paginated track fetch, streaming chunks back tagged with `load`.
+    /// Load a track list: paint the cached copy first (skipping the network if it is fresh),
+    /// otherwise stream live pages tagged with `load`.
     fn spawn_tracks<F, Fut>(&self, load: u64, f: F)
     where
         F: FnOnce(Box<dyn FnMut(Vec<Track>, u32) + Send>) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send,
     {
-        let tx = self.tx.clone();
+        let key = match self.view.as_ref() {
+            Some(View::Tracks(l)) if l.load == load => l.cache_key.clone(),
+            _ => self.back.iter().find_map(|v| match v {
+                View::Tracks(l) if l.load == load => l.cache_key.clone(),
+                _ => None,
+            }),
+        };
+        let (tx, cache) = (self.tx.clone(), self.cache.clone());
         tokio::spawn(async move {
+            if let Some(key) = &key {
+                if let Some(c) = cache.read::<TrackCache>(key).await {
+                    let fresh = c.age < TRACKS_FRESH;
+                    let _ = tx.send(Event::Data(Data::CachedTracks { load, cache: c.data, fresh }));
+                    if fresh {
+                        return;
+                    }
+                }
+            }
             let chunk_tx = tx.clone();
             let res = f(Box::new(move |tracks, total| {
                 let _ = chunk_tx.send(Event::Data(Data::TrackChunk { load, tracks, total }));
@@ -618,14 +874,10 @@ impl App {
                     Entry::Track(t) => {
                         // Play the selected track followed by the other track results.
                         let mut uris = vec![t.uri.clone()];
-                        uris.extend(
-                            l.entries
-                                .iter()
-                                .filter_map(|e| match e {
-                                    Entry::Track(o) if o.uri != t.uri => Some(o.uri.clone()),
-                                    _ => None,
-                                }),
-                        );
+                        uris.extend(l.entries.iter().filter_map(|e| match e {
+                            Entry::Track(o) if o.uri != t.uri => Some(o.uri.clone()),
+                            _ => None,
+                        }));
                         self.player.play_tracks(uris, 0);
                     }
                     Entry::Album(a) => self.open_album(&a),
@@ -634,10 +886,46 @@ impl App {
                         self.player.play_context(a.uri, 0);
                         self.toast(format!("Playing {}", a.name));
                     }
+                    Entry::Section(s) => self.open_section(s),
+                    Entry::Station { name, seed } => self.play_station(name, seed),
                 }
             }
             None => {}
         }
+    }
+
+    /// Radio from the selected track/artist/station (`R`).
+    fn start_radio(&mut self) {
+        if self.focus != Focus::Content {
+            return;
+        }
+        let seed = match &self.view {
+            Some(View::Tracks(l)) => l
+                .state
+                .selected()
+                .and_then(|i| l.tracks.get(i))
+                .map(|t| (t.name.clone(), t.uri.clone())),
+            Some(View::Entries(l)) => match l.state.selected().and_then(|i| l.entries.get(i)) {
+                Some(Entry::Track(t)) => Some((t.name.clone(), t.uri.clone())),
+                Some(Entry::Artist(a)) => Some((a.name.clone(), a.uri.clone())),
+                Some(Entry::Station { name, seed }) => Some((name.clone(), seed.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        match seed {
+            Some((name, uri)) => self.play_station(name, uri),
+            None => self.toast("Nothing here to start a radio from"),
+        }
+    }
+
+    fn play_station(&mut self, name: String, seed: String) {
+        self.toast(format!("Starting {name} radio…"));
+        let (session, tx) = (self.player.session().clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let result = browse::station_tracks(&session, &seed).await;
+            let _ = tx.send(Event::Data(Data::Station { name, result }));
+        });
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::app::{App, Entry, EntryList, Focus, Status, TrackList, View};
+use crate::app::{App, Entry, EntryList, FIXED_SIDEBAR_ITEMS, Focus, Status, TrackList, View};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -56,7 +56,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, s)| {
             // Playlists (index 3+) are visually separated from fixed entries.
-            let style = if i >= 3 { Style::new() } else { Style::new().bold() };
+            let style = if i >= FIXED_SIDEBAR_ITEMS { Style::new() } else { Style::new().bold() };
             ListItem::new(s.label().to_string()).style(style)
         })
         .collect();
@@ -158,7 +158,10 @@ fn draw_entries(f: &mut Frame, app: &mut App, l: &mut EntryList, area: Rect, foc
                     ),
                 ),
                 Entry::Artist(a) => ("artist", a.name.clone()),
-                Entry::Playlist(p) => ("playlist", p.name.clone()),
+                Entry::Playlist(p) if p.description.is_empty() => ("playlist", p.name.clone()),
+                Entry::Playlist(p) => ("playlist", format!("{} — {}", p.name, strip_tags(&p.description))),
+                Entry::Section(s) => ("browse", s.label().to_string()),
+                Entry::Station { name, .. } => ("radio", format!("{name} Radio")),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{kind:<9}"), Style::new().fg(DIM)),
@@ -242,6 +245,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("< / >", "seek -5s / +5s"),
         ("+ / -", "volume"),
         ("s / r", "shuffle / cycle repeat"),
+        ("R", "start radio from selected track/artist/station"),
         ("q, ctrl-c", "quit"),
     ];
     let w = 56.min(area.width);
@@ -253,4 +257,19 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .collect();
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(pane("Help", true)), rect);
+}
+
+/// Editorial descriptions contain markup like `<a href=...>Artist</a>`; keep only the text.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }

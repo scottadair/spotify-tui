@@ -1,4 +1,5 @@
 use crate::api::models::{Album, Playlist, SearchResults, Track};
+use crate::app::{Entry, TrackCache};
 use crate::player::PlaybackEvent;
 use crossterm::event::{Event as CtEvent, EventStream, KeyEvent, KeyEventKind};
 use futures::StreamExt;
@@ -22,7 +23,13 @@ pub enum Data {
     /// A chunk of a track list identified by the load id of the view that requested it.
     TrackChunk { load: u64, tracks: Vec<Track>, total: u32 },
     TrackLoadDone { load: u64, error: Option<String> },
+    /// Cached copy of a track list; `fresh` means no live fetch will follow.
+    CachedTracks { load: u64, cache: TrackCache, fresh: bool },
     Search { seq: u64, result: anyhow::Result<SearchResults> },
+    /// Rows for an asynchronously filled entry list (browse pages).
+    Entries { load: u64, result: anyhow::Result<Vec<Entry>> },
+    /// Track URIs of a radio station that should start playing.
+    Station { name: String, result: anyhow::Result<Vec<String>> },
 }
 
 /// Terminal input + tick producers.

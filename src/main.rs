@@ -1,6 +1,8 @@
 mod api;
 mod app;
 mod auth;
+mod browse;
+mod cache;
 mod config;
 mod event;
 mod player;
@@ -45,7 +47,8 @@ async fn main() -> Result<()> {
 
     let mut terminal = ratatui::init(); // installs a panic hook that restores the terminal
     event::spawn_input(tx.clone());
-    let mut app = App::new(api, started.handle, tx, started.volume);
+    let data_cache = cache::Cache::new(paths.cache_dir.join("data"));
+    let mut app = App::new(api, started.handle, data_cache, tx, started.volume);
 
     let result: Result<()> = async {
         while !app.quit {

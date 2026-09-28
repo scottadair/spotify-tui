@@ -15,4 +15,5 @@ Press `?` in the app.
 - `auth.rs` PKCE login + refreshing token cache (Web API). `player.rs` librespot session/Spirc; playback state comes from player events, not polling.
 - `api/` Web API client (Feb 2026 endpoints: `/playlists/{id}/items`, search limit 10). Paged lists stream in chunks, fetched concurrently.
 - `app.rs` state + input; `ui/` rendering; redraw only when state changed.
+- `browse.rs` Browse page: curated editorial playlists (names resolved live via the streaming session), Spotify's popular list, radio stations. `cache.rs` disk cache (`~/.cache/spotify-tui/data`): browse pages and top artists use TTLs, playlists and track lists paint from cache instantly then refresh (skipping the network if under 5 minutes old).
 - Logs: `~/.cache/spotify-tui/spotify-tui.log`.

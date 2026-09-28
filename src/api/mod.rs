@@ -125,6 +125,24 @@ impl Api {
         self.all_pages::<SavedTrack, _>("/me/tracks", &[], |t| t.track, on_chunk).await
     }
 
+    /// Your most-listened artists (used to seed radio stations).
+    pub async fn top_artists(&self) -> Result<Vec<Artist>> {
+        let page: Page<Artist> = self
+            .get("/me/top/artists", &[("limit", "30".into()), ("time_range", "medium_term".into())])
+            .await?;
+        Ok(page.items)
+    }
+
+    /// Up to 50 most recent plays (cursor-paginated by Spotify, so a single request).
+    pub async fn recently_played(&self, mut on_chunk: impl FnMut(Vec<Track>, u32)) -> Result<()> {
+        let page: Page<SavedTrack> =
+            self.get("/me/player/recently-played", &[("limit", "50".into())]).await?;
+        let tracks: Vec<Track> = page.items.into_iter().filter_map(|t| t.track).collect();
+        let total = tracks.len() as u32;
+        on_chunk(tracks, total);
+        Ok(())
+    }
+
     pub async fn playlist_tracks(&self, id: &str, on_chunk: impl FnMut(Vec<Track>, u32)) -> Result<()> {
         self.all_pages::<PlaylistItem, _>(&format!("/playlists/{id}/items"), &[], |t| t.item, on_chunk).await
     }
