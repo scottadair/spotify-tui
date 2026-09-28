@@ -28,6 +28,8 @@ pub struct TrackInfo {
     pub name: String,
     pub artists: String,
     pub album: String,
+    /// Largest cover, served from Spotify's image CDN.
+    pub cover_url: Option<String>,
     pub duration_ms: u32,
 }
 
@@ -171,6 +173,7 @@ fn map_event(ev: PlayerEvent) -> Option<PlaybackEvent> {
                 name: audio_item.name.clone(),
                 artists,
                 album,
+                cover_url: audio_item.covers.first().map(|c| c.url.clone()),
                 duration_ms: audio_item.duration_ms,
             })
         }

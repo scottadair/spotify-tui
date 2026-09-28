@@ -9,12 +9,14 @@ anyhow = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 directories = "6"
 futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 librespot-connect = { version = "0.8", default-features = false }
 librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-metadata = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-oauth = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
 ratatui = "0.30"
+ratatui-image = { version = "12.0.0-rc.0", default-features = false, features = ["image-defaults", "crossterm"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 serde = { version = "1", features = ["derive"] }

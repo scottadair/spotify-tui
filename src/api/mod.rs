@@ -146,6 +146,35 @@ impl Api {
         Ok(())
     }
 
+    /// Playlists behind your last 50 plays, newest first. Playlists in `known` are reused;
+    /// others (e.g. followed or Spotify-made) are looked up, and dropped if inaccessible.
+    pub async fn recent_playlists(&self, known: Vec<Playlist>) -> Result<Vec<Playlist>> {
+        let page: Page<PlayHistoryItem> =
+            self.get("/me/player/recently-played", &[("limit", "50".into())]).await?;
+        let mut seen = std::collections::HashSet::new();
+        let uris: Vec<String> = page
+            .items
+            .into_iter()
+            .filter_map(|i| i.context)
+            .filter(|c| c.kind == "playlist" && seen.insert(c.uri.clone()))
+            .map(|c| c.uri)
+            .collect();
+        let known = &known;
+        let out = stream::iter(uris)
+            .map(|uri| async move {
+                if let Some(p) = known.iter().find(|p| p.uri == uri) {
+                    return Some(p.clone());
+                }
+                let id = uri.rsplit(':').next()?;
+                self.get::<Playlist>(&format!("/playlists/{id}"), &[]).await.ok()
+            })
+            .buffered(CONCURRENCY)
+            .filter_map(|p| async move { p })
+            .collect()
+            .await;
+        Ok(out)
+    }
+
     pub async fn playlist_tracks(&self, id: &str, on_chunk: impl FnMut(Vec<Track>, u32)) -> Result<()> {
         self.all_pages::<PlaylistItem, _>(&format!("/playlists/{id}/items"), &[], |t| t.item, on_chunk).await
     }

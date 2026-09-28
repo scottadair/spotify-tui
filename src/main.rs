@@ -46,9 +46,12 @@ async fn main() -> Result<()> {
     let player = started.handle.clone();
 
     let mut terminal = ratatui::init(); // installs a panic hook that restores the terminal
+    // Must run after entering the alternate screen and before the input task starts reading stdin.
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     event::spawn_input(tx.clone());
     let data_cache = cache::Cache::new(paths.cache_dir.join("data"));
-    let mut app = App::new(api, started.handle, data_cache, tx, started.volume);
+    let mut app = App::new(api, started.handle, data_cache, tx, started.volume, picker);
 
     let result: Result<()> = async {
         while !app.quit {

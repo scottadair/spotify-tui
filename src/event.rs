@@ -22,6 +22,8 @@ pub enum Data {
     Albums(anyhow::Result<Vec<Album>>),
     /// A chunk of a track list identified by the load id of the view that requested it.
     TrackChunk { load: u64, tracks: Vec<Track>, total: u32 },
+    /// Decoded album art for `url` (`None` if the download or decode failed).
+    Cover { url: String, image: Option<image::DynamicImage> },
     TrackLoadDone { load: u64, error: Option<String> },
     /// Cached copy of a track list; `fresh` means no live fetch will follow.
     CachedTracks { load: u64, cache: TrackCache, fresh: bool },

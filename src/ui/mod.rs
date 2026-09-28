@@ -1,18 +1,26 @@
-use crate::app::{App, Entry, EntryList, FIXED_SIDEBAR_ITEMS, Focus, Status, TrackList, View};
+use crate::app::{App, Entry, EntryList, FIXED_SIDEBAR_ITEMS, Focus, Now, Status, TrackList, View};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, LineGauge, List, ListItem, Paragraph, Row, Table,
     },
 };
+use ratatui_image::{FilterType, Resize, StatefulImage};
 
 const ACCENT: Color = Color::Rgb(30, 215, 96);
 const DIM: Color = Color::DarkGray;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    if app.fullscreen {
+        draw_fullscreen(f, app, f.area());
+        if app.help {
+            draw_help(f, f.area());
+        }
+        return;
+    }
     let [main, player, footer] = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(4),
@@ -50,21 +58,27 @@ fn highlight(focused: bool) -> Style {
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
-    let items: Vec<ListItem> = app
-        .sidebar
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            // Playlists (index 3+) are visually separated from fixed entries.
-            let style = if i >= FIXED_SIDEBAR_ITEMS { Style::new() } else { Style::new().bold() };
-            ListItem::new(s.label().to_string()).style(style)
-        })
-        .collect();
+    let has_playlists = app.sidebar.len() > FIXED_SIDEBAR_ITEMS;
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.sidebar.len() + 1);
+    for (i, s) in app.sidebar.iter().enumerate() {
+        if i == FIXED_SIDEBAR_ITEMS && has_playlists {
+            // Non-selectable divider; selection is shifted past it below.
+            let width = area.width.saturating_sub(2) as usize;
+            let label = " Playlists ";
+            let side = width.saturating_sub(label.chars().count()) / 2;
+            let line = format!("{}{label}{}", "─".repeat(side), "─".repeat(width.saturating_sub(side + label.chars().count())));
+            items.push(ListItem::new(line).style(Style::new().fg(DIM)));
+        }
+        let style = if i >= FIXED_SIDEBAR_ITEMS { Style::new() } else { Style::new().bold() };
+        items.push(ListItem::new(s.label().to_string()).style(style));
+    }
+    let shift = |i: usize| if has_playlists && i >= FIXED_SIDEBAR_ITEMS { i + 1 } else { i };
+    app.sidebar_view.select(app.sidebar_state.selected().map(shift));
     let list = List::new(items)
         .block(pane("Library", focused))
         .highlight_style(highlight(focused))
         .highlight_symbol("▌");
-    f.render_stateful_widget(list, area, &mut app.sidebar_state);
+    f.render_stateful_widget(list, area, &mut app.sidebar_view);
 }
 
 fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
@@ -178,16 +192,7 @@ fn draw_entries(f: &mut Frame, app: &mut App, l: &mut EntryList, area: Rect, foc
 
 fn draw_player(f: &mut Frame, app: &App, area: Rect) {
     let now = &app.now;
-    let mode = format!(
-        " vol {}%  shuffle {}  repeat {} ",
-        now.volume_percent(),
-        if now.shuffle { "on" } else { "off" },
-        match (now.repeat_ctx, now.repeat_track) {
-            (_, true) => "track",
-            (true, false) => "all",
-            _ => "off",
-        }
-    );
+    let mode = mode_text(now);
     let block = pane("Now Playing", false).title_bottom(Line::styled(mode, Style::new().fg(DIM)).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -220,11 +225,102 @@ fn draw_player(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(gauge, bar);
 }
 
+fn mode_text(now: &Now) -> String {
+    format!(
+        " vol {}%  shuffle {}  repeat {} ",
+        now.volume_percent(),
+        if now.shuffle { "on" } else { "off" },
+        match (now.repeat_ctx, now.repeat_track) {
+            (_, true) => "track",
+            (true, false) => "all",
+            _ => "off",
+        }
+    )
+}
+
+/// Maximised player: album art centred above the track details and progress bar.
+fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = pane("Now Playing", true)
+        .title_bottom(Line::styled("f/esc back  ? help", Style::new().fg(DIM)).centered());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let [art, _, title, artist, album, _, bar, mode] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // Largest square (in pixels) that fits, centred; terminal cells are not square.
+    let font = app.picker.font_size();
+    let (fw, fh) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+    let mut h = u32::from(art.height);
+    let mut w = h * fh / fw;
+    if w > u32::from(art.width) {
+        w = u32::from(art.width);
+        h = w * fw / fh;
+    }
+    let (w, h) = (w as u16, h as u16);
+    let art_rect = Rect::new(art.x + (art.width - w) / 2, art.y + (art.height - h) / 2, w, h);
+    match app.cover.as_mut().and_then(|c| c.proto.as_mut()) {
+        Some(proto) => f.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle))),
+            art_rect,
+            proto,
+        ),
+        None => f.render_widget(
+            Paragraph::new("♪").style(Style::new().fg(DIM)).alignment(Alignment::Center),
+            Rect::new(art.x, art.y + art.height / 2, art.width, 1.min(art.height)),
+        ),
+    }
+
+    let now = &app.now;
+    let icon = match now.status {
+        Status::Playing => "▶",
+        Status::Paused => "⏸",
+        Status::Loading => "…",
+        Status::Stopped => "■",
+    };
+    let centered = |line: Line<'static>| Paragraph::new(line).alignment(Alignment::Center);
+    match &now.track {
+        Some(t) => {
+            f.render_widget(
+                centered(Line::from(vec![
+                    Span::styled(format!("{icon} "), Style::new().fg(ACCENT)),
+                    Span::styled(t.name.clone(), Style::new().bold()),
+                ])),
+                title,
+            );
+            f.render_widget(centered(Line::raw(t.artists.clone())), artist);
+            f.render_widget(centered(Line::styled(t.album.clone(), Style::new().fg(DIM))), album);
+        }
+        None => f.render_widget(centered(Line::styled(format!("{icon} Nothing playing"), Style::new().fg(DIM))), title),
+    }
+
+    let (pos, dur) = (now.position_ms(), now.track.as_ref().map_or(0, |t| t.duration_ms));
+    let ratio = if dur == 0 { 0.0 } else { (f64::from(pos) / f64::from(dur)).clamp(0.0, 1.0) };
+    let bar_w = bar.width.min(70);
+    let bar = Rect::new(bar.x + (bar.width - bar_w) / 2, bar.y, bar_w, bar.height);
+    let gauge = LineGauge::default()
+        .filled_style(Style::new().fg(ACCENT))
+        .unfilled_style(Style::new().fg(DIM))
+        .label(format!("{} / {}", fmt_ms(pos), fmt_ms(dur)))
+        .ratio(ratio);
+    f.render_widget(gauge, bar);
+    f.render_widget(centered(Line::styled(mode_text(now), Style::new().fg(DIM))), mode);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.status {
         Some((msg, _)) => Line::styled(msg.clone(), Style::new().fg(Color::Yellow)),
         None => Line::styled(
-            "space play/pause  n/p next/prev  / search  tab focus  enter play/open  esc back  ? help  q quit",
+            "space play/pause  n/p next/prev  f full player  / search  tab focus  enter play/open  esc back  ? help  q quit",
             Style::new().fg(DIM),
         ),
     };
@@ -241,6 +337,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("esc, backspace", "back"),
         ("/", "search (enter to run, esc to cancel)"),
         ("space", "play / pause"),
+        ("f", "full-screen player with album art"),
         ("n / p", "next / previous"),
         ("< / >", "seek -5s / +5s"),
         ("+ / -", "volume"),

@@ -57,6 +57,18 @@ pub struct SavedTrack {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PlayHistoryItem {
+    pub context: Option<PlayContext>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayContext {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub uri: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PlaylistItem {
     /// Renamed `track` -> `item` in the Feb 2026 API.
     #[serde(alias = "track")]

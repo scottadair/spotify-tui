@@ -8,6 +8,7 @@ use crate::event::{Data, Event};
 use crate::player::{PlaybackEvent, PlayerHandle, TrackInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -141,13 +142,14 @@ pub enum View {
 }
 
 /// Sidebar rows before the user's playlists start.
-pub const FIXED_SIDEBAR_ITEMS: usize = 4;
+pub const FIXED_SIDEBAR_ITEMS: usize = 5;
 
 pub enum SidebarItem {
     Search,
     Browse,
     Liked,
     Albums,
+    RecentPlaylists,
     Playlist(Playlist),
 }
 
@@ -158,6 +160,7 @@ impl SidebarItem {
             SidebarItem::Browse => "Browse",
             SidebarItem::Liked => "Liked Songs",
             SidebarItem::Albums => "Saved Albums",
+            SidebarItem::RecentPlaylists => "Recent Playlists",
             SidebarItem::Playlist(p) => &p.name,
         }
     }
@@ -188,6 +191,12 @@ pub struct Now {
     pub shuffle: bool,
     pub repeat_ctx: bool,
     pub repeat_track: bool,
+}
+
+/// Album art for the current track; `proto` is filled once the download decodes.
+pub struct Cover {
+    pub url: String,
+    pub proto: Option<StatefulProtocol>,
 }
 
 impl Now {
@@ -223,12 +232,17 @@ pub struct App {
 
     pub sidebar: Vec<SidebarItem>,
     pub sidebar_state: ListState,
+    /// Render-only state: `sidebar_state` shifted past the separator row, carrying the scroll offset.
+    pub sidebar_view: ListState,
     pub focus: Focus,
     pub view: Option<View>,
     back: Vec<View>,
     pub now: Now,
     pub status: Option<(String, Instant)>,
     pub help: bool,
+    pub fullscreen: bool,
+    pub picker: Picker,
+    pub cover: Option<Cover>,
     /// Rows visible in the content pane; set by the renderer, used for paging.
     pub page: usize,
 
@@ -239,7 +253,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(api: Api, player: PlayerHandle, cache: Cache, tx: UnboundedSender<Event>, volume: u16) -> Self {
+    pub fn new(
+        api: Api,
+        player: PlayerHandle,
+        cache: Cache,
+        tx: UnboundedSender<Event>,
+        volume: u16,
+        picker: Picker,
+    ) -> Self {
         let mut app = Self {
             api,
             player,
@@ -250,8 +271,10 @@ impl App {
                 SidebarItem::Browse,
                 SidebarItem::Liked,
                 SidebarItem::Albums,
+                SidebarItem::RecentPlaylists,
             ],
             sidebar_state: ListState::default().with_selected(Some(2)),
+            sidebar_view: ListState::default(),
             focus: Focus::Sidebar,
             view: None,
             back: Vec::new(),
@@ -267,6 +290,9 @@ impl App {
             },
             status: None,
             help: false,
+            fullscreen: false,
+            picker,
+            cover: None,
             page: 10,
             next_load: 0,
             next_search: 0,
@@ -283,6 +309,27 @@ impl App {
         tracing::warn!("{msg}");
         self.status = Some((msg, Instant::now()));
         self.dirty = true;
+    }
+
+    /// Track the cover for the current track, downloading it if it changed.
+    fn set_cover(&mut self, url: Option<String>) {
+        if self.cover.as_ref().map(|c| &c.url) == url.as_ref() {
+            return;
+        }
+        self.cover = url.clone().map(|url| Cover { url, proto: None });
+        let Some(url) = url else { return };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let image = async {
+                let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+                let img = tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??;
+                anyhow::Ok(img)
+            }
+            .await
+            .map_err(|e| tracing::warn!("cover {url}: {e:#}"))
+            .ok();
+            let _ = tx.send(Event::Data(Data::Cover { url, image }));
+        });
     }
 
     // ------------------------------------------------------------ events
@@ -311,8 +358,10 @@ impl App {
         match ev {
             PlaybackEvent::Loading => now.status = Status::Loading,
             PlaybackEvent::Track(t) => {
+                let url = t.cover_url.clone();
                 now.track = Some(t);
                 now.set_position(0);
+                self.set_cover(url);
             }
             PlaybackEvent::Playing { position_ms } => {
                 now.status = Status::Playing;
@@ -340,6 +389,13 @@ impl App {
     fn on_data(&mut self, d: Data) {
         self.dirty = true;
         match d {
+            Data::Cover { url, image } => {
+                if let (Some(c), Some(img)) = (&mut self.cover, image) {
+                    if c.url == url {
+                        c.proto = Some(self.picker.new_resize_protocol(img));
+                    }
+                }
+            }
             Data::Playlists(Ok(list)) => {
                 self.sidebar.truncate(FIXED_SIDEBAR_ITEMS);
                 self.sidebar.extend(list.into_iter().map(SidebarItem::Playlist));
@@ -484,8 +540,21 @@ impl App {
             self.on_search_key(k);
             return;
         }
+        // The full-screen player only answers transport keys; everything else would act on hidden panes.
+        if self.fullscreen
+            && !matches!(
+                k.code,
+                KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f')
+                    | KeyCode::Esc
+                    | KeyCode::Backspace
+            )
+        {
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+            KeyCode::Esc | KeyCode::Backspace if self.fullscreen => self.fullscreen = false,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char(' ') => self.player.play_pause(),
@@ -681,6 +750,23 @@ impl App {
                 let (api, tx) = (self.api.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     let _ = tx.send(Event::Data(Data::Albums(api.saved_albums().await)));
+                });
+            }
+            SidebarItem::RecentPlaylists => {
+                let load = self.new_load();
+                self.view = Some(View::Entries(EntryList::new("Recent Playlists", Vec::new(), true, load)));
+                let known: Vec<Playlist> = self
+                    .sidebar
+                    .iter()
+                    .filter_map(|s| if let SidebarItem::Playlist(p) = s { Some(p.clone()) } else { None })
+                    .collect();
+                let (api, tx) = (self.api.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    let result = api
+                        .recent_playlists(known)
+                        .await
+                        .map(|l| l.into_iter().map(Entry::Playlist).collect());
+                    let _ = tx.send(Event::Data(Data::Entries { load, result }));
                 });
             }
             SidebarItem::Playlist(p) => {
