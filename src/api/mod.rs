@@ -29,8 +29,11 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 impl HttpError {
-    pub fn is_forbidden(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<HttpError>().is_some_and(|h| h.status == StatusCode::FORBIDDEN)
+    /// The Web API refuses (403) or hides (404) playlists you don't own, including Spotify's
+    /// editorial ones; those must be read through the streaming session instead.
+    pub fn is_inaccessible(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<HttpError>()
+            .is_some_and(|h| matches!(h.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND))
     }
 }
 

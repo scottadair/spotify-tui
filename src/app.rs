@@ -770,7 +770,7 @@ impl App {
         self.spawn_tracks(load, move |mut on| async move {
             match api.playlist_tracks(&id, &mut on).await {
                 // Web API only serves playlists you own; use the streaming session for the rest.
-                Err(e) if HttpError::is_forbidden(&e) => player.playlist_tracks(&uri, on).await,
+                Err(e) if HttpError::is_inaccessible(&e) => player.playlist_tracks(&uri, on).await,
                 res => res,
             }
         });
