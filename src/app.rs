@@ -167,6 +167,14 @@ impl SidebarItem {
             SidebarItem::Playlist(p) => &p.name,
         }
     }
+
+    /// Stable identity across playlist reloads, which may reorder the sidebar.
+    fn key(&self) -> &str {
+        match self {
+            SidebarItem::Playlist(p) => &p.uri,
+            other => other.label(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -240,6 +248,8 @@ pub struct App {
     pub focus: Focus,
     pub view: Option<View>,
     back: Vec<View>,
+    /// Key of the sidebar item the current view stack was opened from.
+    view_root: Option<String>,
     pub now: Now,
     pub status: Option<(String, Instant)>,
     pub help: bool,
@@ -287,6 +297,7 @@ impl App {
             focus: Focus::Sidebar,
             view: None,
             back: Vec::new(),
+            view_root: None,
             now: Now {
                 track: None,
                 status: Status::Stopped,
@@ -600,15 +611,9 @@ impl App {
             KeyCode::Char('>') => self.seek(true),
             KeyCode::Char('<') => self.seek(false),
             KeyCode::Char('/') => self.open_search(),
-            KeyCode::Tab => {
-                if self.focus == Focus::Sidebar {
-                    self.focus_content();
-                } else {
-                    self.focus = Focus::Sidebar;
-                }
-            }
+            KeyCode::Tab if self.focus == Focus::Content => self.focus = Focus::Sidebar,
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => self.enter_content(),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Sidebar,
-            KeyCode::Char('l') | KeyCode::Right if self.view.is_some() => self.focus_content(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('d') if ctrl => self.move_selection((self.page / 2).max(1) as isize),
@@ -628,6 +633,21 @@ impl App {
             },
             KeyCode::Esc | KeyCode::Backspace => self.go_back(),
             _ => {}
+        }
+    }
+
+    /// Moves into the content pane for the highlighted sidebar item. The existing
+    /// view stack (including drill-downs) is kept only if it belongs to that item;
+    /// otherwise the item is opened fresh.
+    fn enter_content(&mut self) {
+        if self.focus == Focus::Sidebar {
+            let highlighted = self.sidebar_state.selected().and_then(|i| self.sidebar.get(i)).map(SidebarItem::key);
+            if highlighted != self.view_root.as_deref() {
+                self.open_sidebar_selection();
+            }
+        }
+        if self.view.is_some() {
+            self.focus_content();
         }
     }
 
@@ -758,6 +778,7 @@ impl App {
         let Some(i) = self.sidebar_state.selected() else { return };
         self.back.clear();
         self.view = None;
+        self.view_root = Some(self.sidebar[i].key().to_owned());
         match &self.sidebar[i] {
             SidebarItem::Search => {
                 let mut list = EntryList::new("Search", Vec::new(), false, 0);
