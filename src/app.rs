@@ -601,10 +601,14 @@ impl App {
             KeyCode::Char('<') => self.seek(false),
             KeyCode::Char('/') => self.open_search(),
             KeyCode::Tab => {
-                self.focus = if self.focus == Focus::Sidebar { Focus::Content } else { Focus::Sidebar };
+                if self.focus == Focus::Sidebar {
+                    self.focus_content();
+                } else {
+                    self.focus = Focus::Sidebar;
+                }
             }
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Sidebar,
-            KeyCode::Char('l') | KeyCode::Right if self.view.is_some() => self.focus = Focus::Content,
+            KeyCode::Char('l') | KeyCode::Right if self.view.is_some() => self.focus_content(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('d') if ctrl => self.move_selection((self.page / 2).max(1) as isize),
@@ -617,13 +621,24 @@ impl App {
                 Focus::Sidebar => {
                     self.open_sidebar_selection();
                     if self.view.is_some() {
-                        self.focus = Focus::Content;
+                        self.focus_content();
                     }
                 }
                 Focus::Content => self.activate(),
             },
             KeyCode::Esc | KeyCode::Backspace => self.go_back(),
             _ => {}
+        }
+    }
+
+    /// Moves focus to the content pane; an empty search view starts in typing mode
+    /// so the query can be entered without pressing `/` first.
+    fn focus_content(&mut self) {
+        self.focus = Focus::Content;
+        if let Some(View::Entries(EntryList { search: Some(s), .. })) = &mut self.view {
+            if s.query.is_empty() {
+                s.editing = true;
+            }
         }
     }
 
@@ -735,10 +750,7 @@ impl App {
         let idx = self.sidebar.iter().position(|s| matches!(s, SidebarItem::Search)).unwrap_or(0);
         self.sidebar_state.select(Some(idx));
         self.open_sidebar_selection();
-        if let Some(View::Entries(EntryList { search: Some(s), .. })) = &mut self.view {
-            s.editing = true;
-        }
-        self.focus = Focus::Content;
+        self.focus_content();
     }
 
     /// Sidebar selections replace the whole view stack (they are roots).
