@@ -146,11 +146,23 @@ impl Api {
         Ok(())
     }
 
-    /// Playlists behind your last 50 plays, newest first. Playlists in `known` are reused;
-    /// others (e.g. followed or Spotify-made) are looked up, and dropped if inaccessible.
-    pub async fn recent_playlists(&self, known: Vec<Playlist>) -> Result<Vec<Playlist>> {
+    /// URIs of the playlists behind your last 50 plays, newest first. The Web API can't look up
+    /// Spotify-made playlists (404), so names are resolved through the streaming session instead.
+    pub async fn recent_playlist_uris(&self) -> Result<Vec<String>> {
         let page: Page<PlayHistoryItem> =
             self.get("/me/player/recently-played", &[("limit", "50".into())]).await?;
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut no_context = 0;
+        for item in &page.items {
+            match &item.context {
+                Some(c) => *kinds.entry(c.kind.clone()).or_default() += 1,
+                None => no_context += 1,
+            }
+        }
+        tracing::info!(
+            "recent playlists: {} plays, {no_context} without context, contexts by type {kinds:?}",
+            page.items.len()
+        );
         let mut seen = std::collections::HashSet::new();
         let uris: Vec<String> = page
             .items
@@ -159,20 +171,8 @@ impl Api {
             .filter(|c| c.kind == "playlist" && seen.insert(c.uri.clone()))
             .map(|c| c.uri)
             .collect();
-        let known = &known;
-        let out = stream::iter(uris)
-            .map(|uri| async move {
-                if let Some(p) = known.iter().find(|p| p.uri == uri) {
-                    return Some(p.clone());
-                }
-                let id = uri.rsplit(':').next()?;
-                self.get::<Playlist>(&format!("/playlists/{id}"), &[]).await.ok()
-            })
-            .buffered(CONCURRENCY)
-            .filter_map(|p| async move { p })
-            .collect()
-            .await;
-        Ok(out)
+        tracing::info!("recent playlists: {} distinct playlist contexts: {uris:?}", uris.len());
+        Ok(uris)
     }
 
     pub async fn playlist_tracks(&self, id: &str, on_chunk: impl FnMut(Vec<Track>, u32)) -> Result<()> {

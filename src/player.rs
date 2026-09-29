@@ -270,6 +270,19 @@ impl PlayerHandle {
     }
 }
 
+/// Name a playlist through the streaming session's metadata endpoints (works for Spotify-made
+/// playlists, which the Web API 404s on).
+pub async fn playlist_info(session: &Session, uri: &str) -> Result<crate::api::models::Playlist> {
+    let spotify_uri = SpotifyUri::from_uri(uri)?;
+    let list = MetaPlaylist::get(session, &spotify_uri).await?;
+    Ok(crate::api::models::Playlist {
+        id: uri.rsplit(':').next().unwrap_or(uri).to_string(),
+        uri: uri.to_string(),
+        name: list.attributes.name.clone(),
+        description: String::new(),
+    })
+}
+
 fn to_api_track(t: MetaTrack) -> Option<ApiTrack> {
     Some(ApiTrack {
         uri: t.id.to_uri().ok()?,

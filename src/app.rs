@@ -760,12 +760,32 @@ impl App {
                     .iter()
                     .filter_map(|s| if let SidebarItem::Playlist(p) = s { Some(p.clone()) } else { None })
                     .collect();
-                let (api, tx) = (self.api.clone(), self.tx.clone());
+                let (api, session, tx) = (self.api.clone(), self.player.session().clone(), self.tx.clone());
                 tokio::spawn(async move {
-                    let result = api
-                        .recent_playlists(known)
-                        .await
-                        .map(|l| l.into_iter().map(Entry::Playlist).collect());
+                    let result = async {
+                        let uris = api.recent_playlist_uris().await?;
+                        let known = &known;
+                        let session = &session;
+                        let lookups = uris.into_iter().map(|uri| async move {
+                            if let Some(p) = known.iter().find(|p| p.uri == uri) {
+                                return Some(p.clone());
+                            }
+                            match crate::player::playlist_info(session, &uri).await {
+                                Ok(p) => {
+                                    tracing::info!("recent playlists: {uri} resolved ({})", p.name);
+                                    Some(p)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("recent playlists: {uri} unresolved, dropping: {e:#}");
+                                    None
+                                }
+                            }
+                        });
+                        anyhow::Ok(
+                            futures::future::join_all(lookups).await.into_iter().flatten().map(Entry::Playlist).collect(),
+                        )
+                    }
+                    .await;
                     let _ = tx.send(Event::Data(Data::Entries { load, result }));
                 });
             }
@@ -960,6 +980,12 @@ impl App {
                 let Some(i) = l.state.selected() else { return };
                 // The context is only usable when every item is present, so indices line up.
                 let exact = l.skipped == 0 && !l.loading && l.tracks.len() as u32 == l.total;
+                if l.context.is_some() && !exact {
+                    tracing::info!(
+                        "playing {} from bare track URIs, not context (skipped {}, loading {}, {}/{} loaded)",
+                        l.title, l.skipped, l.loading, l.tracks.len(), l.total
+                    );
+                }
                 match (&l.context, exact) {
                     (Some(uri), true) => self.player.play_context(uri.clone(), i),
                     _ => {
