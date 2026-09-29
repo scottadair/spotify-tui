@@ -60,11 +60,20 @@ async fn main() -> Result<()> {
 
     let result: Result<()> = async {
         while !app.quit {
-            if app.dirty {
+            if app.dirty || app.anim.running() {
                 app.dirty = false;
                 terminal.draw(|f| ui::draw(f, &mut app))?;
             }
-            let Some(ev) = rx.recv().await else { break };
+            // A running transition needs frames even when nothing else happens.
+            let ev = if app.anim.running() {
+                match tokio::time::timeout(ui::FRAME, rx.recv()).await {
+                    Ok(ev) => ev,
+                    Err(_) => continue,
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(ev) = ev else { break };
             app.on_event(ev);
             // Drain everything already queued so bursts (page chunks) cost one redraw.
             while let Ok(ev) = rx.try_recv() {

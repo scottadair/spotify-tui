@@ -120,6 +120,8 @@ pub struct EntryList {
     pub title: String,
     pub entries: Vec<Entry>,
     pub state: ListState,
+    /// Render-only state: `state` shifted past group header rows, carrying the scroll offset.
+    pub view: TableState,
     pub search: Option<SearchState>,
     pub loading: bool,
     /// Load id for asynchronously filled lists (0 = not applicable).
@@ -132,7 +134,7 @@ impl EntryList {
         if !entries.is_empty() {
             state.select(Some(0));
         }
-        Self { title: title.into(), entries, state, search: None, loading, load }
+        Self { title: title.into(), entries, state, view: TableState::default(), search: None, loading, load }
     }
 }
 
@@ -240,11 +242,15 @@ pub struct App {
     pub now: Now,
     pub status: Option<(String, Instant)>,
     pub help: bool,
+    /// First visible help line; clamped by the renderer when the overlay fits.
+    pub help_scroll: u16,
     pub fullscreen: bool,
     pub picker: Picker,
     pub cover: Option<Cover>,
     /// Rows visible in the content pane; set by the renderer, used for paging.
     pub page: usize,
+    /// Renderer-owned pane transition state.
+    pub anim: crate::ui::Anim,
 
     next_load: u64,
     next_search: u64,
@@ -290,10 +296,12 @@ impl App {
             },
             status: None,
             help: false,
+            help_scroll: 0,
             fullscreen: false,
             picker,
             cover: None,
             page: 10,
+            anim: crate::ui::Anim::default(),
             next_load: 0,
             next_search: 0,
             quit: false,
@@ -302,6 +310,11 @@ impl App {
         app.spawn_playlists();
         app.open_sidebar_selection();
         app
+    }
+
+    /// Views stacked behind the current one; grows on forward navigation.
+    pub fn depth(&self) -> usize {
+        self.back.len()
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -529,7 +542,15 @@ impl App {
     fn on_key(&mut self, k: KeyEvent) {
         self.dirty = true;
         if self.help {
-            self.help = false;
+            // Short terminals can't show all of it: j/k scroll, anything else closes.
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                _ => {
+                    self.help = false;
+                    self.help_scroll = 0;
+                }
+            }
             return;
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
