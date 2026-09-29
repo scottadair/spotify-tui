@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use librespot_core::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::LazyLock, time::Duration};
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 const ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
 const INTEGRATION: &str = "INTEGRATION_WEB_PLAYER";
@@ -23,6 +23,17 @@ const BROWSE_SECTION: &str = "b13c1cccbfcb6947753c2613411b3566485c21fd5f36d80a80
 const PAGE_STEP: u32 = 10;
 const SECTION_STEP: u32 = 100;
 
+/// Leading top-level categories probed for being hubs; Spotify lists Music, Podcasts and
+/// Audiobooks first.
+const HUB_CANDIDATES: usize = 4;
+/// A hub's grid must list at least this many top-level categories to count as one (Podcasts
+/// lists only Educational and Comedy).
+const HUB_MIN_OVERLAP: usize = 2;
+/// Group for top-level categories that no hub lists.
+const NO_HUB: &str = "More";
+/// Shelf type of a page's category grid ("Browse all" on Music, "Categories" on Podcasts).
+const GRID_SECTION: &str = "BrowseGridSectionData";
+
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap_or_default()
 });
@@ -33,6 +44,9 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub struct Category {
     pub uri: String,
     pub name: String,
+    /// Top-level categories only: the hub ("Music", "Podcasts", …) that lists this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<String>,
 }
 
 /// One shelf on a page ("Rock Classics").
@@ -89,6 +103,8 @@ struct WireSection {
 #[derive(Deserialize, Default)]
 struct SectionData {
     title: Option<Label>,
+    #[serde(default, rename = "__typename")]
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -200,7 +216,7 @@ impl WireItem {
                     return None;
                 }
                 let name = data.data?.card?.title?.text;
-                Some(Item::Page(Category { uri, name }))
+                Some(Item::Page(Category { uri, name, hub: None }))
             }
             Content::Unsupported => None,
         }
@@ -253,14 +269,15 @@ fn sections_at(mut data: Value, key: &str) -> Result<Sections> {
 
 // ---------------------------------------------------------------- browse
 
-/// The live "Browse all" catalogue: every top-level category, in Spotify's order.
+/// The live "Browse all" catalogue: every top-level category, grouped by hub. Hubs keep Spotify's
+/// order, each followed by the categories its grid lists; categories no hub lists come last.
 pub async fn categories(session: &Session) -> Result<Vec<Category>> {
     let vars = json!({
         "pagePagination": { "offset": 0, "limit": PAGE_STEP },
         "sectionPagination": { "offset": 0, "limit": 99 },
     });
     let data = query(session, "browseAll", BROWSE_ALL, vars).await?;
-    let out: Vec<Category> = sections_at(data, "browseStart")?
+    let top: Vec<Category> = sections_at(data, "browseStart")?
         .items
         .into_iter()
         .flat_map(|s| s.items.items)
@@ -270,15 +287,80 @@ pub async fn categories(session: &Session) -> Result<Vec<Category>> {
             _ => None,
         })
         .collect();
-    if out.is_empty() {
+    if top.is_empty() {
         bail!("Browse all returned no categories");
     }
+
+    // Hub grids sometimes link a different page for the same category (Podcasts' "Comedy" is not
+    // the top-level "Comedy"), so fall back to matching by name.
+    let by_uri: HashMap<&str, usize> = top.iter().enumerate().map(|(i, c)| (c.uri.as_str(), i)).collect();
+    let by_name: HashMap<&str, usize> = top.iter().enumerate().map(|(i, c)| (c.name.as_str(), i)).collect();
+    let lookup = |c: &Category| by_uri.get(c.uri.as_str()).or_else(|| by_name.get(c.name.as_str())).copied();
+    let grids = futures::future::join_all(top.iter().take(HUB_CANDIDATES).map(|c| hub_grid(session, &c.uri))).await;
+    let hubs: Vec<(usize, Vec<usize>)> = grids
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, grid)| match grid {
+            Ok(children) => Some((i, children?.iter().filter_map(lookup).collect::<Vec<_>>())),
+            Err(e) => {
+                tracing::warn!("browse hub {}: {e:#}", top[i].name);
+                None
+            }
+        })
+        .filter(|(_, children)| children.len() >= HUB_MIN_OVERLAP)
+        .collect();
+    if hubs.is_empty() {
+        return Ok(top);
+    }
+
+    let mut pending: Vec<Option<Category>> = top.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(pending.len());
+    for (h, children) in hubs {
+        let Some(mut hub) = pending[h].take() else { continue };
+        let name = hub.name.clone();
+        hub.hub = Some(name.clone());
+        out.push(hub);
+        for i in children {
+            if let Some(mut c) = pending[i].take() {
+                c.hub = Some(name.clone());
+                out.push(c);
+            }
+        }
+    }
+    out.extend(pending.into_iter().flatten().map(|mut c| {
+        c.hub = Some(NO_HUB.to_string());
+        c
+    }));
     Ok(out)
 }
 
-/// Every shelf of a page. Empty shelves are dropped.
-pub async fn page_groups(session: &Session, page_uri: &str) -> Result<Vec<Group>> {
-    let mut groups = Vec::new();
+/// Sub-pages in a page's category grid, if it has one.
+async fn hub_grid(session: &Session, page_uri: &str) -> Result<Option<Vec<Category>>> {
+    let Some(grid) = page_sections(session, page_uri).await?.into_iter().find(|s| s.data.kind == GRID_SECTION) else {
+        return Ok(None);
+    };
+    let total = grid.items.total;
+    let carried = grid.items.items.len() as u32 >= total;
+    let items: Vec<Item> = grid.items.items.into_iter().filter_map(WireItem::into_item).collect();
+    let items = if carried {
+        items
+    } else {
+        group_items(session, Group { uri: grid.uri, title: String::new(), total, items: Vec::new() }).await?
+    };
+    Ok(Some(
+        items
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Page(c) => Some(c),
+                _ => None,
+            })
+            .collect(),
+    ))
+}
+
+/// Every shelf of a page, across `browsePage` pagination.
+async fn page_sections(session: &Session, page_uri: &str) -> Result<Vec<WireSection>> {
+    let mut out = Vec::new();
     let mut offset = 0;
     loop {
         let vars = json!({
@@ -289,21 +371,28 @@ pub async fn page_groups(session: &Session, page_uri: &str) -> Result<Vec<Group>
         });
         let data = query(session, "browsePage", BROWSE_PAGE, vars).await?;
         let sections = sections_at(data, "browse")?;
-        for s in sections.items {
-            let total = s.items.total;
-            let complete = s.items.items.len() as u32 >= total;
-            let items: Vec<Item> = s.items.items.into_iter().filter_map(WireItem::into_item).collect();
-            // Nothing this client can play (podcasts, audiobooks…).
-            if total == 0 || (complete && items.is_empty()) {
-                continue;
-            }
-            let items = if complete { items } else { Vec::new() };
-            groups.push(Group { title: s.data.title.map_or_else(String::new, |t| t.text), uri: s.uri, total, items });
-        }
+        out.extend(sections.items);
         match sections.paging.next_offset {
             Some(next) if next > offset => offset = next,
             _ => break,
         }
+    }
+    Ok(out)
+}
+
+/// Every shelf of a page. Empty shelves are dropped.
+pub async fn page_groups(session: &Session, page_uri: &str) -> Result<Vec<Group>> {
+    let mut groups = Vec::new();
+    for s in page_sections(session, page_uri).await? {
+        let total = s.items.total;
+        let complete = s.items.items.len() as u32 >= total;
+        let items: Vec<Item> = s.items.items.into_iter().filter_map(WireItem::into_item).collect();
+        // Nothing this client can play (podcasts, audiobooks…).
+        if total == 0 || (complete && items.is_empty()) {
+            continue;
+        }
+        let items = if complete { items } else { Vec::new() };
+        groups.push(Group { title: s.data.title.map_or_else(String::new, |t| t.text), uri: s.uri, total, items });
     }
     if groups.is_empty() {
         bail!("page has no playlists or albums");

@@ -728,13 +728,13 @@ impl App {
                 let session = self.player.session().clone();
                 self.spawn_entries(
                     load,
-                    "browse-categories".into(),
+                    "browse-hubs".into(),
                     CATEGORY_TTL,
                     async move { browse::categories(&session).await },
                     |cats: Vec<Category>| {
-                        cats.into_iter()
-                            .map(|c| Entry::Section(Section::Page(c)))
-                            .chain([Entry::Section(Section::Stations), Entry::Section(Section::Recent)])
+                        [Entry::Section(Section::Stations), Entry::Section(Section::Recent)]
+                            .into_iter()
+                            .chain(cats.into_iter().map(|c| Entry::Section(Section::Page(c))))
                             .collect()
                     },
                 );
