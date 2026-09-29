@@ -22,6 +22,7 @@ const SCOPES: &[&str] = &[
     "user-top-read",
     "user-read-recently-played",
     "user-read-private",
+    "user-read-playback-state",
 ];
 
 /// Refresh this long before actual expiry.
@@ -66,6 +67,11 @@ impl WebAuth {
 
         let token = match cached {
             Some(s) => match oauth.refresh_token_async(&s.refresh_token).await {
+                // A token granted before a scope was added keeps its old scopes on refresh.
+                Ok(t) if !SCOPES.iter().all(|&want| t.scopes.iter().any(|have| have == want)) => {
+                    tracing::info!("cached token lacks scopes {SCOPES:?} (has {:?}), re-authenticating", t.scopes);
+                    None
+                }
                 Ok(mut t) => {
                     if t.refresh_token.is_empty() {
                         t.refresh_token = s.refresh_token;

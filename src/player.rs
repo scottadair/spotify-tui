@@ -124,10 +124,10 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
     let mut rx = player.get_player_event_channel();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            if let Some(ev) = map_event(ev) {
-                if events.send(ev).is_err() {
-                    break;
-                }
+            if let Some(ev) = map_event(ev)
+                && events.send(ev).is_err()
+            {
+                break;
             }
         }
     });

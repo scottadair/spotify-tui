@@ -49,15 +49,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         depth: app.depth(),
         sidebar_focused: app.focus == Focus::Sidebar,
         fullscreen: app.fullscreen,
+        up_next: app.up_next_open,
     };
     let before = app.anim.observe(now);
     let inset = |r: Rect| r.inner(Margin { vertical: 1, horizontal: 1 });
 
     if app.fullscreen {
         let area = f.area();
-        draw_fullscreen(f, app, area);
-        if before.is_some_and(|b| !b.fullscreen) {
-            app.anim.start(inset(area), Side::Bottom);
+        let (player, queue) = draw_fullscreen(f, app, area);
+        // Up Next comes in from the right like any forward move; closing it brings the player
+        // back from the left.
+        let transition = match before {
+            Some(b) if !b.fullscreen => Some((area, Side::Bottom)),
+            Some(b) if b.up_next != now.up_next => {
+                if now.up_next { queue.map(|q| (q, Side::Right)) } else { player.map(|p| (p, Side::Left)) }
+            }
+            _ => None,
+        };
+        if let Some((area, side)) = transition {
+            app.anim.start(inset(area), side);
         }
     } else {
         let player_h = if f.area().height < SHORT_HEIGHT { 2 } else { PLAYER_HEIGHT };
@@ -330,14 +340,21 @@ fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
     match &mut view {
         View::Tracks(l) => {
             app.page = usize::from(area.height.saturating_sub(3));
-            draw_tracks(f, l, area, focused, app.now.track.as_ref().map(|t| t.uri.as_str()));
+            draw_tracks(f, l, area, focused, app.now.track.as_ref().map(|t| t.uri.as_str()), "No playable tracks");
         }
         View::Entries(l) => draw_entries(f, app, l, area, focused),
     }
     app.view = Some(view);
 }
 
-fn draw_tracks(f: &mut Frame, l: &mut TrackList, area: Rect, focused: bool, playing_uri: Option<&str>) {
+fn draw_tracks(
+    f: &mut Frame,
+    l: &mut TrackList,
+    area: Rect,
+    focused: bool,
+    playing_uri: Option<&str>,
+    empty: &str,
+) {
     let mut block = pane(&l.title, focused);
     if l.loading {
         block = with_info(block, &l.title, format!("loading {}/{}", l.tracks.len(), l.total), area.width);
@@ -349,7 +366,7 @@ fn draw_tracks(f: &mut Frame, l: &mut TrackList, area: Rect, focused: bool, play
     let inner = block.inner(area);
     if l.tracks.is_empty() {
         f.render_widget(block, area);
-        placeholder(f, inner, if l.loading { "Loading…" } else { "No playable tracks" });
+        placeholder(f, inner, if l.loading { "Loading…" } else { empty });
         return;
     }
 
@@ -661,36 +678,71 @@ fn draw_player(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(progress(now, bar.width), bar);
 }
 
-/// Maximised player: album art centred above the track details and progress bar.
-fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = pane("Now Playing", true)
-        .title_bottom(Line::from(hint_spans(&[("f/esc", "back"), ("?", "help")], usize::MAX)).centered());
+/// Maximised player. → adds the Up Next pane on the right (in place of the player when the
+/// terminal is too narrow for both). Returns the player and Up Next areas that were drawn.
+fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) -> (Option<Rect>, Option<Rect>) {
+    if !app.up_next_open {
+        draw_now_playing(f, app, area, true);
+        return (Some(area), None);
+    }
+    let (player, queue) = if area.width < SINGLE_PANE_WIDTH {
+        (None, area)
+    } else {
+        let [p, q] = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
+        (Some(p), q)
+    };
+    if let Some(p) = player {
+        draw_now_playing(f, app, p, false);
+    }
+    app.page = usize::from(queue.height.saturating_sub(3));
+    draw_tracks(f, &mut app.up_next, queue, true, None, "Nothing queued");
+    // Over the pane's bottom border, where the single player pane keeps its hints.
+    let hints = Rect::new(queue.x + 1, queue.bottom().saturating_sub(1), queue.width.saturating_sub(2), 1);
+    f.render_widget(
+        Line::from(hint_spans(&[("←/esc", "player"), ("f", "exit"), ("?", "help")], usize::from(hints.width)))
+            .centered(),
+        hints,
+    );
+    (player, Some(queue))
+}
+
+/// Album art and track details centred vertically above the progress bar.
+fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let mut block = pane("Now Playing", focused);
+    if focused {
+        block = block.title_bottom(
+            Line::from(hint_spans(&[("→", "up next"), ("f/esc", "back"), ("?", "help")], usize::MAX)).centered(),
+        );
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [art, _, title, artist, album, _, bar, mode] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+    let [body, _, bar, mode] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .areas(inner);
+
+    // Largest square (in pixels) that fits above the three detail lines; terminal cells are not square.
+    const DETAILS_H: u16 = 4;
+    let font = app.picker.font_size();
+    let (fw, fh) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+    let mut h = u32::from(body.height.saturating_sub(DETAILS_H));
+    let mut w = h * fh / fw;
+    if w > u32::from(body.width) {
+        w = u32::from(body.width);
+        h = w * fw / fh;
+    }
+    let (w, h) = (w as u16, h as u16);
+    // Art and details as one block, centred in the space above the progress bar.
+    let [art, _, title, artist, album] = Layout::vertical([
+        Constraint::Length(h),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(inner);
-
-    // Largest square (in pixels) that fits, centred; terminal cells are not square.
-    let font = app.picker.font_size();
-    let (fw, fh) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
-    let mut h = u32::from(art.height);
-    let mut w = h * fh / fw;
-    if w > u32::from(art.width) {
-        w = u32::from(art.width);
-        h = w * fw / fh;
-    }
-    let (w, h) = (w as u16, h as u16);
-    let art_rect = Rect::new(art.x + (art.width - w) / 2, art.y + (art.height - h) / 2, w, h);
+    .flex(Flex::Center)
+    .areas(body);
+    let art_rect = Rect::new(art.x + (art.width - w) / 2, art.y, w, art.height);
     // Graphics-protocol images aren't cells, so they can't be greyed out behind a popup.
     let popup = app.help || app.settings.open;
     match app.cover.as_mut().and_then(|c| c.proto.as_mut()).filter(|_| !popup) {
@@ -710,20 +762,13 @@ fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) {
     match &now.track {
         Some(t) => {
             f.render_widget(
-                centered(Line::from(vec![
-                    status_icon(now.status),
-                    Span::raw("  "),
-                    Span::styled(t.name.clone(), Style::new().fg(Color::White).bold()),
-                ])),
+                centered(Line::styled(t.name.clone(), Style::new().fg(Color::White).bold())),
                 title,
             );
             f.render_widget(centered(Line::styled(t.artists.clone(), MUTED)), artist);
             f.render_widget(centered(Line::styled(t.album.clone(), DIM)), album);
         }
-        None => f.render_widget(
-            centered(Line::from(vec![status_icon(now.status), Span::styled("  Nothing playing", DIM)])),
-            title,
-        ),
+        None => f.render_widget(centered(Line::styled("Nothing playing", DIM)), title),
     }
 
     let bar_w = bar.width.min(70);
@@ -856,6 +901,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("App", &[
         ("f", "full-screen player with album art"),
+        ("→  l", "up next (in the full-screen player)"),
         (",", "settings"),
         ("?", "this help"),
         ("q  ctrl-c", "quit"),

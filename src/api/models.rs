@@ -57,6 +57,12 @@ pub struct SavedTrack {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct Queue {
+    #[serde(default)]
+    pub queue: Vec<Track>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PlayHistoryItem {
     pub context: Option<PlayContext>,
 }

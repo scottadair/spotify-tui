@@ -146,6 +146,13 @@ impl Api {
         Ok(())
     }
 
+    /// What plays after the current track on the active device: queued items first, then the
+    /// rest of the context (shuffle order included). Spotify returns about 20 items.
+    pub async fn queue(&self) -> Result<Vec<Track>> {
+        let q: Queue = self.get("/me/player/queue", &[]).await?;
+        Ok(q.queue)
+    }
+
     /// URIs of the playlists behind your last 50 plays, newest first. The Web API can't look up
     /// Spotify-made playlists (404), so names are resolved through the streaming session instead.
     pub async fn recent_playlist_uris(&self) -> Result<Vec<String>> {

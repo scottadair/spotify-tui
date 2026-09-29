@@ -30,6 +30,8 @@ pub struct Seen {
     pub depth: usize,
     pub sidebar_focused: bool,
     pub fullscreen: bool,
+    /// The full-screen player's Up Next pane is showing.
+    pub up_next: bool,
 }
 
 #[derive(Default)]

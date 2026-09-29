@@ -32,6 +32,8 @@ pub enum Data {
     Entries { load: u64, result: anyhow::Result<Vec<Entry>> },
     /// Track URIs of a radio station that should start playing.
     Station { name: String, result: anyhow::Result<Vec<String>> },
+    /// Up Next for the full-screen player; stale unless `seq` matches the pane's load id.
+    Queue { seq: u64, result: anyhow::Result<Vec<Track>> },
 }
 
 /// Terminal input + tick producers.

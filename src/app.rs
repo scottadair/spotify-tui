@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const VOLUME_STEP: u16 = u16::MAX / 20;
+/// Wait after a track or shuffle change before asking for the queue, so Spirc's state
+/// update (sent ~200 ms later) has reached Spotify.
+const QUEUE_SETTLE: Duration = Duration::from_secs(1);
 const SEEK_STEP_MS: u32 = 5_000;
 const STATUS_TTL: Duration = Duration::from_secs(5);
 
@@ -257,6 +260,9 @@ pub struct App {
     pub help_scroll: u16,
     pub settings: Settings,
     pub fullscreen: bool,
+    /// The full-screen player's Up Next pane is showing (and has focus).
+    pub up_next_open: bool,
+    pub up_next: TrackList,
     pub picker: Picker,
     pub cover: Option<Cover>,
     /// Rows visible in the content pane; set by the renderer, used for paging.
@@ -313,6 +319,8 @@ impl App {
             help_scroll: 0,
             settings,
             fullscreen: false,
+            up_next_open: false,
+            up_next: TrackList::new("Up Next".into(), 0, None, None),
             picker,
             cover: None,
             page: 10,
@@ -390,6 +398,7 @@ impl App {
                 now.track = Some(t);
                 now.set_position(0);
                 self.set_cover(url);
+                self.refresh_up_next(QUEUE_SETTLE);
             }
             PlaybackEvent::Playing { position_ms } => {
                 now.status = Status::Playing;
@@ -405,7 +414,10 @@ impl App {
             }
             PlaybackEvent::Seeked { position_ms } => now.set_position(position_ms),
             PlaybackEvent::Volume(v) => now.volume = v,
-            PlaybackEvent::Shuffle(s) => now.shuffle = s,
+            PlaybackEvent::Shuffle(s) => {
+                now.shuffle = s;
+                self.refresh_up_next(QUEUE_SETTLE);
+            }
             PlaybackEvent::Repeat { context, track } => {
                 now.repeat_ctx = context;
                 now.repeat_track = track;
@@ -418,10 +430,10 @@ impl App {
         self.dirty = true;
         match d {
             Data::Cover { url, image } => {
-                if let (Some(c), Some(img)) = (&mut self.cover, image) {
-                    if c.url == url {
-                        c.proto = Some(self.picker.new_resize_protocol(img));
-                    }
+                if let (Some(c), Some(img)) = (&mut self.cover, image)
+                    && c.url == url
+                {
+                    c.proto = Some(self.picker.new_resize_protocol(img));
                 }
             }
             Data::Playlists(Ok(list)) => {
@@ -430,18 +442,18 @@ impl App {
             }
             Data::Playlists(Err(e)) => self.toast(format!("Playlists: {e:#}")),
             Data::Albums(res) => {
-                if let Some(View::Entries(l)) = &mut self.view {
-                    if l.title == "Saved Albums" {
-                        l.loading = false;
-                        match res {
-                            Ok(albums) => {
-                                l.entries = albums.into_iter().map(Entry::Album).collect();
-                                if !l.entries.is_empty() {
-                                    l.state.select(Some(0));
-                                }
+                if let Some(View::Entries(l)) = &mut self.view
+                    && l.title == "Saved Albums"
+                {
+                    l.loading = false;
+                    match res {
+                        Ok(albums) => {
+                            l.entries = albums.into_iter().map(Entry::Album).collect();
+                            if !l.entries.is_empty() {
+                                l.state.select(Some(0));
                             }
-                            Err(e) => self.toast(format!("Albums: {e:#}")),
                         }
+                        Err(e) => self.toast(format!("Albums: {e:#}")),
                     }
                 }
             }
@@ -520,17 +532,32 @@ impl App {
                 }
                 Err(e) => self.toast(format!("Radio: {e:#}")),
             },
-            Data::Search { seq, result } => {
-                if let Some(View::Entries(l)) = &mut self.view {
-                    if matches!(&l.search, Some(s) if s.seq == seq) {
-                        l.loading = false;
-                        match result {
-                            Ok(r) => {
-                                l.entries = flatten_search(r);
-                                l.state.select(if l.entries.is_empty() { None } else { Some(0) });
-                            }
-                            Err(e) => self.toast(format!("Search: {e:#}")),
+            Data::Queue { seq, result } => {
+                let l = &mut self.up_next;
+                if l.load == seq {
+                    l.loading = false;
+                    match result {
+                        Ok(tracks) => {
+                            l.total = tracks.len() as u32;
+                            l.tracks = tracks;
+                            let sel = l.state.selected().unwrap_or(0).min(l.tracks.len().saturating_sub(1));
+                            l.state.select((!l.tracks.is_empty()).then_some(sel));
                         }
+                        Err(e) => self.toast(format!("Up next: {e:#}")),
+                    }
+                }
+            }
+            Data::Search { seq, result } => {
+                if let Some(View::Entries(l)) = &mut self.view
+                    && matches!(&l.search, Some(s) if s.seq == seq)
+                {
+                    l.loading = false;
+                    match result {
+                        Ok(r) => {
+                            l.entries = flatten_search(r);
+                            l.state.select(if l.entries.is_empty() { None } else { Some(0) });
+                        }
+                        Err(e) => self.toast(format!("Search: {e:#}")),
                     }
                 }
             }
@@ -582,20 +609,35 @@ impl App {
             self.on_search_key(k);
             return;
         }
-        // The full-screen player only answers transport keys; everything else would act on hidden panes.
-        if self.fullscreen
-            && !matches!(
-                k.code,
-                KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f' | ',')
-                    | KeyCode::Esc
-                    | KeyCode::Backspace
-            )
-        {
-            return;
-        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // The full-screen player answers transport keys, ← → for its Up Next pane, and list
+        // movement while that pane is open; everything else would act on hidden panes.
+        if self.fullscreen {
+            let open = self.up_next_open;
+            match k.code {
+                KeyCode::Right | KeyCode::Char('l') => return self.open_up_next(),
+                KeyCode::Left | KeyCode::Char('h') => return self.up_next_open = false,
+                KeyCode::Esc | KeyCode::Backspace if open => return self.up_next_open = false,
+                KeyCode::Char('j' | 'k' | 'g' | 'G')
+                | KeyCode::Down
+                | KeyCode::Up
+                | KeyCode::PageDown
+                | KeyCode::PageUp
+                | KeyCode::Home
+                | KeyCode::End
+                    if open => {}
+                KeyCode::Char('d' | 'u') if open && ctrl => {}
+                KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f' | ',')
+                | KeyCode::Esc
+                | KeyCode::Backspace => {}
+                _ => return,
+            }
+        }
         match k.code {
-            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+            KeyCode::Char('f') => {
+                self.fullscreen = !self.fullscreen;
+                self.up_next_open = false;
+            }
             KeyCode::Esc | KeyCode::Backspace if self.fullscreen => self.fullscreen = false,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
@@ -655,10 +697,10 @@ impl App {
     /// so the query can be entered without pressing `/` first.
     fn focus_content(&mut self) {
         self.focus = Focus::Content;
-        if let Some(View::Entries(EntryList { search: Some(s), .. })) = &mut self.view {
-            if s.query.is_empty() {
-                s.editing = true;
-            }
+        if let Some(View::Entries(EntryList { search: Some(s), .. })) = &mut self.view
+            && s.query.is_empty()
+        {
+            s.editing = true;
         }
     }
 
@@ -722,8 +764,34 @@ impl App {
 
     // ------------------------------------------------------------ navigation
 
+    /// Shows the full-screen player's Up Next pane with a fresh copy of the queue.
+    fn open_up_next(&mut self) {
+        self.up_next_open = true;
+        self.refresh_up_next(Duration::ZERO);
+    }
+
+    /// Fetches the queue after `delay` if the Up Next pane is showing; an earlier request still
+    /// in flight is superseded.
+    fn refresh_up_next(&mut self, delay: Duration) {
+        if !(self.fullscreen && self.up_next_open) {
+            return;
+        }
+        let seq = self.new_load();
+        let l = &mut self.up_next;
+        l.load = seq;
+        // A refresh keeps the current rows up; only an empty pane shows "Loading…".
+        l.loading = l.tracks.is_empty();
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = api.queue().await;
+            let _ = tx.send(Event::Data(Data::Queue { seq, result }));
+        });
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let (len, sel): (usize, Option<usize>) = match self.focus {
+            _ if self.fullscreen => (self.up_next.tracks.len(), self.up_next.state.selected()),
             Focus::Sidebar => (self.sidebar.len(), self.sidebar_state.selected()),
             Focus::Content => match &self.view {
                 Some(View::Tracks(l)) => (l.tracks.len(), l.state.selected()),
@@ -740,6 +808,7 @@ impl App {
             d => (sel.unwrap_or(0) as isize + d).clamp(0, len as isize - 1) as usize,
         };
         match self.focus {
+            _ if self.fullscreen => self.up_next.state.select(Some(next)),
             Focus::Sidebar => self.sidebar_state.select(Some(next)),
             Focus::Content => match &mut self.view {
                 Some(View::Tracks(l)) => l.state.select(Some(next)),
@@ -920,11 +989,11 @@ impl App {
         let (cache, tx) = (self.cache.clone(), self.tx.clone());
         tokio::spawn(async move {
             let cached = cache.read::<Vec<T>>(&key).await;
-            if let Some(c) = &cached {
-                if c.age < ttl {
-                    let _ = tx.send(Event::Data(Data::Entries { load, result: Ok(wrap(c.data.clone())) }));
-                    return;
-                }
+            if let Some(c) = &cached
+                && c.age < ttl
+            {
+                let _ = tx.send(Event::Data(Data::Entries { load, result: Ok(wrap(c.data.clone())) }));
+                return;
             }
             let result = match fetch.await {
                 Ok(items) => {
@@ -1018,13 +1087,13 @@ impl App {
         };
         let (tx, cache) = (self.tx.clone(), self.cache.clone());
         tokio::spawn(async move {
-            if let Some(key) = &key {
-                if let Some(c) = cache.read::<TrackCache>(key).await {
-                    let fresh = c.age < TRACKS_FRESH;
-                    let _ = tx.send(Event::Data(Data::CachedTracks { load, cache: c.data, fresh }));
-                    if fresh {
-                        return;
-                    }
+            if let Some(key) = &key
+                && let Some(c) = cache.read::<TrackCache>(key).await
+            {
+                let fresh = c.age < TRACKS_FRESH;
+                let _ = tx.send(Event::Data(Data::CachedTracks { load, cache: c.data, fresh }));
+                if fresh {
+                    return;
                 }
             }
             let chunk_tx = tx.clone();
