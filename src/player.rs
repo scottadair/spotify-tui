@@ -104,14 +104,15 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
         .unwrap_or_else(|| (u32::from(cfg.initial_volume.min(100)) * u32::from(u16::MAX) / 100) as u16);
     mixer.set_volume(volume);
 
-    let bitrate = match cfg.bitrate {
-        0..=96 => Bitrate::Bitrate96,
-        97..=160 => Bitrate::Bitrate160,
+    let bitrate = match cfg.bitrate_kbps() {
+        96 => Bitrate::Bitrate96,
+        160 => Bitrate::Bitrate160,
         _ => Bitrate::Bitrate320,
     };
     let player_cfg = PlayerConfig {
         bitrate,
         gapless: cfg.gapless,
+        normalisation: cfg.normalisation,
         ..Default::default()
     };
     let backend = audio_backend::find(None).context("no audio backend compiled in")?;

@@ -6,6 +6,7 @@ mod cache;
 mod config;
 mod event;
 mod player;
+mod settings;
 mod ui;
 
 use anyhow::Result;
@@ -56,7 +57,8 @@ async fn main() -> Result<()> {
     }
     event::spawn_input(tx.clone());
     let data_cache = cache::Cache::new(paths.cache_dir.join("data"));
-    let mut app = App::new(api, started.handle, data_cache, tx, started.volume, picker);
+    let settings = settings::Settings::new(cfg, paths.config_file.clone());
+    let mut app = App::new(api, started.handle, data_cache, tx, started.volume, picker, settings);
 
     let result: Result<()> = async {
         while !app.quit {

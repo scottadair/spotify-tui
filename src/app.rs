@@ -6,6 +6,7 @@ use crate::browse::{self, Category, Group, Item};
 use crate::cache::Cache;
 use crate::event::{Data, Event};
 use crate::player::{PlaybackEvent, PlayerHandle, TrackInfo};
+use crate::settings::{Outcome, Settings};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
@@ -244,6 +245,7 @@ pub struct App {
     pub help: bool,
     /// First visible help line; clamped by the renderer when the overlay fits.
     pub help_scroll: u16,
+    pub settings: Settings,
     pub fullscreen: bool,
     pub picker: Picker,
     pub cover: Option<Cover>,
@@ -266,6 +268,7 @@ impl App {
         tx: UnboundedSender<Event>,
         volume: u16,
         picker: Picker,
+        settings: Settings,
     ) -> Self {
         let mut app = Self {
             api,
@@ -297,6 +300,7 @@ impl App {
             status: None,
             help: false,
             help_scroll: 0,
+            settings,
             fullscreen: false,
             picker,
             cover: None,
@@ -557,6 +561,12 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.settings.open {
+            if let Outcome::Close = self.settings.on_key(k) {
+                self.settings.open = false;
+            }
+            return;
+        }
         if self.editing_search() {
             self.on_search_key(k);
             return;
@@ -565,7 +575,7 @@ impl App {
         if self.fullscreen
             && !matches!(
                 k.code,
-                KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f')
+                KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f' | ',')
                     | KeyCode::Esc
                     | KeyCode::Backspace
             )
@@ -578,6 +588,7 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace if self.fullscreen => self.fullscreen = false,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char(',') => self.settings.open = true,
             KeyCode::Char(' ') => self.player.play_pause(),
             KeyCode::Char('n') => self.player.next(),
             KeyCode::Char('p') => self.player.prev(),

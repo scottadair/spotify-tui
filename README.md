@@ -5,11 +5,11 @@ Fast Spotify terminal client. Rust, ratatui, embedded librespot (the app is its 
 ## Setup
 1. Install Rust (`mise install`), plus ALSA dev headers.
 2. Create an app at https://developer.spotify.com/dashboard with redirect URI `http://127.0.0.1:8888/callback`.
-3. `cargo run --release` writes `~/.config/spotify-tui/config.toml`; put your Client ID in `client_id` and run again.
+3. `cargo run --release` asks for your Client ID on first run and saves it to `~/.config/spotify-tui/config.toml` (without a terminal on stdin, set `client_id` there instead).
 4. Two one-time browser logins: your app (Web API, PKCE) and the streaming device (librespot's client id, which Spotify requires for streaming but rate-limits heavily on the Web API, so it is never used for browsing). Tokens are cached.
 
-## Keys
-Press `?` in the app.
+## Keys & settings
+Press `?` in the app for keys. `,` opens settings (audio quality, volume normalisation, gapless, device name, Client ID); changes are saved to `config.toml` and apply on next launch.
 
 ## Design
 - `auth.rs` PKCE login + refreshing token cache (Web API). `player.rs` librespot session/Spirc; playback state comes from player events, not polling.

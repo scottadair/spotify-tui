@@ -6,14 +6,15 @@ use crate::api::models::Track;
 use crate::app::{
     App, Entry, EntryList, FIXED_SIDEBAR_ITEMS, Focus, Now, Section, SidebarItem, Status, TrackList, View,
 };
+use crate::settings::{FIELDS, Settings};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+        Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding,
+        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Wrap,
     },
 };
 use ratatui_image::{FilterType, Resize, StatefulImage};
@@ -106,8 +107,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     app.anim.apply(f.buffer_mut());
+    if app.help || app.settings.open {
+        dim_behind(f);
+    }
     if app.help {
         draw_help(f, f.area(), &mut app.help_scroll);
+    }
+    if app.settings.open {
+        draw_settings(f, f.area(), &app.settings);
     }
 }
 
@@ -684,7 +691,9 @@ fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let (w, h) = (w as u16, h as u16);
     let art_rect = Rect::new(art.x + (art.width - w) / 2, art.y + (art.height - h) / 2, w, h);
-    match app.cover.as_mut().and_then(|c| c.proto.as_mut()) {
+    // Graphics-protocol images aren't cells, so they can't be greyed out behind a popup.
+    let popup = app.help || app.settings.open;
+    match app.cover.as_mut().and_then(|c| c.proto.as_mut()).filter(|_| !popup) {
         Some(proto) => f.render_stateful_widget(
             StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle))),
             art_rect,
@@ -767,6 +776,7 @@ fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("space", "play/pause"),
             ("f", "player"),
             ("q", "quit"),
+            (",", "settings"),
             ("?", "all keys"),
         ],
         (Some(View::Tracks(_)), Focus::Content) => &[
@@ -798,54 +808,201 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, scroll: &mut u16) {
-    const HELP: &[(&str, &[(&str, &str)])] = &[
-        ("Navigate", &[
-            ("j k  ↓ ↑", "move selection"),
-            ("g G", "top / bottom"),
-            ("ctrl-d ctrl-u", "half page down / up"),
-            ("← →  h l  tab", "switch pane"),
-            ("enter", "open / play"),
-            ("esc  backspace", "back"),
-            ("/", "search"),
-        ]),
-        ("Playback", &[
-            ("space", "play / pause"),
-            ("n p", "next / previous"),
-            ("< >", "seek −5s / +5s"),
-            ("+ -", "volume"),
-            ("s", "shuffle"),
-            ("r", "cycle repeat"),
-            ("R", "start radio from the selection"),
-        ]),
-        ("App", &[("f", "full-screen player with album art"), ("?", "this help"), ("q  ctrl-c", "quit")]),
-    ];
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, (section, keys)) in HELP.iter().enumerate() {
-        if i > 0 {
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::styled(*section, Style::new().fg(Color::White).bold()));
-        for (k, d) in *keys {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {k:<16}"), Style::new().fg(ACCENT).bold()),
-                Span::styled(*d, MUTED),
-            ]));
+// ---------------------------------------------------------------- popups
+
+/// Greys out everything drawn so far so a popup stands out: colours, highlights and bold all go.
+fn dim_behind(f: &mut Frame) {
+    for cell in &mut f.buffer_mut().content {
+        cell.set_style(Style::reset().fg(DIM));
+    }
+}
+
+/// Border + horizontal padding a popup adds around its content.
+const POPUP_CHROME_W: u16 = 2 + 4;
+
+/// Popup size for `content` cells: centred, a little off the screen edges, and with a blank row
+/// above and below the content when the terminal is tall enough. Returns the rect and that padding.
+fn popup_rect(area: Rect, content_w: u16, content_h: u16) -> (Rect, u16) {
+    let pad = u16::from(content_h + 2 + 2 + 2 <= area.height);
+    let w = (content_w + POPUP_CHROME_W).min(area.width.saturating_sub(4)).max(area.width.min(20));
+    let h = (content_h + 2 + 2 * pad).min(area.height.saturating_sub(2)).max(area.height.min(3));
+    (Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h), pad)
+}
+
+fn popup_block<'a>(title: &'a str, hints: &[(&'static str, &'static str)], width: u16, pad: u16) -> Block<'a> {
+    pane(title, true)
+        .title_bottom(Line::from(hint_spans(hints, usize::from(width.saturating_sub(4)))).centered())
+        .padding(Padding::new(2, 2, pad, pad))
+}
+
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    ("Navigate", &[
+        ("j k  ↓ ↑", "move selection"),
+        ("g G", "top / bottom"),
+        ("ctrl-d ctrl-u", "half page down / up"),
+        ("← →  h l  tab", "switch pane"),
+        ("enter", "open / play"),
+        ("esc  backspace", "back"),
+        ("/", "search"),
+    ]),
+    ("Playback", &[
+        ("space", "play / pause"),
+        ("n p", "next / previous"),
+        ("< >", "seek −5s / +5s"),
+        ("+ -", "volume"),
+        ("s", "shuffle"),
+        ("r", "cycle repeat"),
+        ("R", "start radio from the selection"),
+    ]),
+    ("App", &[
+        ("f", "full-screen player with album art"),
+        (",", "settings"),
+        ("?", "this help"),
+        ("q  ctrl-c", "quit"),
+    ]),
+];
+const HELP_COLUMN_GAP: u16 = 4;
+
+/// `HELP` split into `n` columns of consecutive sections, balanced by height.
+fn help_columns(n: usize) -> Vec<Vec<Line<'static>>> {
+    let heights: Vec<usize> = HELP.iter().map(|(_, keys)| keys.len() + 1).collect();
+    let target = (heights.iter().sum::<usize>() + heights.len() - 1).div_ceil(n);
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::with_capacity(n);
+    let (mut start, mut h) = (0, 0);
+    for (i, &sh) in heights.iter().enumerate() {
+        if i > start && h + 1 + sh > target && groups.len() + 1 < n {
+            groups.push(start..i);
+            (start, h) = (i, sh);
+        } else {
+            h += if i > start { 1 + sh } else { sh };
         }
     }
-    // Borders plus one column of padding each side.
-    let w = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4).min(area.width);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    groups.push(start..HELP.len());
+
+    groups
+        .into_iter()
+        .map(|g| {
+            let sections = &HELP[g];
+            // Descriptions line up across every section in the column.
+            let key_w = sections.iter().flat_map(|(_, keys)| keys.iter()).map(|(k, _)| k.width()).max().unwrap_or(0) + 3;
+            let mut lines = Vec::new();
+            for (i, (title, keys)) in sections.iter().enumerate() {
+                if i > 0 {
+                    lines.push(Line::raw(""));
+                }
+                lines.push(Line::styled(*title, Style::new().fg(Color::White).bold()));
+                for (k, d) in *keys {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{k:<key_w$}"), Style::new().fg(ACCENT).bold()),
+                        Span::styled(*d, MUTED),
+                    ]));
+                }
+            }
+            lines
+        })
+        .collect()
+}
+
+fn draw_help(f: &mut Frame, area: Rect, scroll: &mut u16) {
+    let size = |cols: &[Vec<Line>]| {
+        let w: usize = cols.iter().map(|c| c.iter().map(Line::width).max().unwrap_or(0)).sum();
+        let w = w as u16 + HELP_COLUMN_GAP * (cols.len() as u16 - 1);
+        (w, cols.iter().map(Vec::len).max().unwrap_or(0) as u16)
+    };
+    // One column when it fits; otherwise spread sideways, as few columns as get it to fit, or as
+    // many as the width allows (and scroll).
+    let fits_w = |w: u16| w + POPUP_CHROME_W + 4 <= area.width;
+    let fits_h = |h: u16| h + 2 + 2 <= area.height;
+    let layouts: Vec<_> = (1..=HELP.len()).map(help_columns).collect();
+    let cols = layouts
+        .iter()
+        .find(|c| {
+            let (w, h) = size(c);
+            fits_w(w) && fits_h(h)
+        })
+        .or_else(|| layouts.iter().rev().find(|c| fits_w(size(c).0)))
+        .unwrap_or(&layouts[0]);
+    let (content_w, content_h) = size(cols);
+
+    let (rect, pad) = popup_rect(area, content_w, content_h);
     // Short terminals: scroll with j/k rather than silently cutting the list off.
-    let hidden = (lines.len() as u16).saturating_sub(h.saturating_sub(2));
+    let visible = rect.height.saturating_sub(2 + 2 * pad);
+    let hidden = content_h.saturating_sub(visible);
     *scroll = (*scroll).min(hidden);
-    let hint = if hidden > 0 { " j/k scroll · any key closes " } else { " any key closes " };
-    let block = pane("Keys", true)
-        .title_bottom(Line::styled(hint, DIM).right_aligned())
-        .padding(ratatui::widgets::Padding::horizontal(1));
+    let hints: &[_] = if hidden > 0 { &[("j k", "scroll"), ("esc", "close")] } else { &[("esc", "close")] };
+    let block = popup_block("Keys", hints, rect.width, pad);
+    let inner = block.inner(rect);
     f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block).scroll((*scroll, 0)), rect);
+    f.render_widget(block, rect);
+
+    let widths = cols.iter().map(|c| Constraint::Length(c.iter().map(Line::width).max().unwrap_or(0) as u16));
+    let areas = Layout::horizontal(widths).spacing(HELP_COLUMN_GAP).split(inner);
+    for (lines, &col) in cols.iter().zip(areas.iter()) {
+        f.render_widget(Paragraph::new(lines.clone()).scroll((*scroll, 0)), col);
+    }
+}
+
+fn draw_settings(f: &mut Frame, area: Rect, s: &Settings) {
+    const PENDING: &str = " ●";
+    // Widest value: a client id, or a choice between ‹ › arrows.
+    const VALUE_W: usize = 32;
+    let label_w = FIELDS.iter().map(|f| f.label().width()).max().unwrap_or(0) + 3;
+
+    let items: Vec<ListItem> = FIELDS
+        .iter()
+        .enumerate()
+        .map(|(i, &field)| {
+            let selected = i == s.selected;
+            let value = field.value(&s.config);
+            let mut spans = vec![Span::styled(format!(" {:<label_w$}", field.label()), MUTED)];
+            match &s.input {
+                Some(input) if selected => {
+                    spans.push(Span::raw(input.clone()));
+                    spans.push(Span::styled("▏", ACCENT));
+                }
+                _ if value.is_empty() => spans.push(Span::styled("not set", DIM)),
+                _ if selected && !field.is_text() => spans.push(Span::raw(format!("‹ {value} ›"))),
+                _ => spans.push(Span::styled(value, Color::White)),
+            }
+            if s.pending(field) {
+                spans.push(Span::styled(PENDING, WARN));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let (note, note_style) = match &s.error {
+        Some(e) => (e.as_str(), Style::new().fg(WARN)),
+        None => (s.field().description(), Style::new().fg(MUTED)),
+    };
+    let list_w = SELECT_SYMBOL.width() + 1 + label_w + VALUE_W + PENDING.width();
+    let content_w = FIELDS.iter().map(|f| f.description().width()).max().unwrap_or(0).max(list_w) as u16;
+    let (rect, pad) = popup_rect(area, content_w, FIELDS.len() as u16 + 2);
+
+    let hints: &[_] = if s.input.is_some() {
+        &[("enter", "save"), ("esc", "cancel")]
+    } else if s.field().is_text() {
+        &[("↑ ↓", "select"), ("enter", "edit"), ("esc", "close")]
+    } else {
+        &[("↑ ↓", "select"), ("← →", "change"), ("esc", "close")]
+    };
+    let mut block = popup_block("Settings", hints, rect.width, pad);
+    if FIELDS.iter().any(|&f| s.pending(f)) {
+        block = block.title(Line::styled(" ● restart to apply ", WARN).right_aligned());
+    }
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let [list_area, _, note_area] =
+        Layout::vertical([Constraint::Length(FIELDS.len() as u16), Constraint::Length(1), Constraint::Min(1)])
+            .areas(inner);
+    let list = List::new(items)
+        .highlight_style(highlight(true))
+        .highlight_symbol(SELECT_SYMBOL)
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, list_area, &mut ListState::default().with_selected(Some(s.selected)));
+    f.render_widget(Paragraph::new(Line::styled(note, note_style)).wrap(Wrap { trim: true }), note_area);
 }
 
 /// Editorial descriptions contain markup like `<a href=...>Artist</a>` and HTML entities; keep only the text.
