@@ -1,19 +1,140 @@
 # spotify-tui
 
-Fast Spotify terminal client. Rust, ratatui, embedded librespot (the app is its own Spotify Connect device; **Premium required**).
+A fast Spotify client for the terminal, written in Rust with [ratatui](https://ratatui.rs) and an embedded [librespot](https://github.com/librespot-org/librespot).
 
-## Setup
-1. Install Rust (`mise install`), plus ALSA dev headers.
-2. Create an app at https://developer.spotify.com/dashboard with redirect URI `http://127.0.0.1:8888/callback`.
-3. `cargo run --release` asks for your Client ID on first run and saves it to `~/.config/spotify-tui/config.toml` (without a terminal on stdin, set `client_id` there instead).
-4. Two one-time browser logins: your app (Web API, PKCE) and the streaming device (librespot's client id, which Spotify requires for streaming but rate-limits heavily on the Web API, so it is never used for browsing). Tokens are cached.
+The app **is its own Spotify Connect device**. Audio plays from your machine; there's no need for the desktop app or a phone to be open. It also shows up in Spotify's device list, so you can control it from your phone as well.
 
-## Keys & settings
-Press `?` in the app for keys. `,` opens settings (audio quality, volume normalisation, gapless, device name, Client ID); changes are saved to `config.toml` and apply on next launch.
+> Requires **Spotify Premium** (librespot streaming only works with Premium accounts).
 
-## Design
-- `auth.rs` PKCE login + refreshing token cache (Web API). `player.rs` librespot session/Spirc; playback state comes from player events, not polling.
-- `api/` Web API client (Feb 2026 endpoints: `/playlists/{id}/items`, search limit 10). Paged lists stream in chunks, fetched concurrently.
-- `app.rs` state + input; `ui/` rendering; redraw only when state changed, plus ~60 fps for the 180 ms of a pane transition (`ui/anim.rs`: contents glide in and un-dim, no colour fades, so any theme works).
-- `browse.rs` Browse page: Spotify's live "Browse all" catalogue (undocumented pathfinder GraphQL persisted queries, authorised with the streaming session's login5 + client token): categories → shelves → every playlist/album, sub-pages included; plus radio stations. `cache.rs` disk cache (`~/.cache/spotify-tui/data`): browse pages and top artists use TTLs, playlists and track lists paint from cache instantly then refresh (skipping the network if under 5 minutes old).
-- Logs: `~/.cache/spotify-tui/spotify-tui.log`.
+![Library view](docs/screenshots/main.png)
+
+| Search | Full-screen player |
+| --- | --- |
+| ![Search results](docs/screenshots/search.png) | ![Full-screen player with album art](docs/screenshots/player.png) |
+
+## Features
+
+- **Your library**: Liked Songs, Saved Albums, all your playlists, and Recent Playlists.
+- **Search** across tracks, artists, albums and playlists.
+- **Browse** Spotify's live "Browse all" catalogue (genres, moods, charts and their sub-pages), plus radio stations from your top artists and a Recently Played list.
+- **Radio** from any track, artist or station (`R`).
+- **Full-screen player** with album art. Uses Kitty, Sixel or iTerm2 graphics when your terminal supports them, with coloured half-blocks everywhere else.
+- **Playback controls**: play/pause, next/previous, seek, volume, shuffle, repeat.
+- **Fast**: lists paint from a local cache instantly and refresh in the background. Playback state comes from player events, not polling, and the screen only redraws when something changes.
+- **Responsive layout**: two panes on wide terminals, one pane at a time on narrow ones.
+- **Settings** in the app: audio quality (96/160/320 kbps), volume normalisation, gapless playback, device name.
+
+## Install
+
+### 1. Prerequisites
+
+- Rust **1.90+**. With [mise](https://mise.jdx.dev), `mise install` in the repo picks up the pinned toolchain; otherwise use [rustup](https://rustup.rs).
+- ALSA development headers and `pkg-config` (Linux audio output):
+
+  | Distro | Command |
+  | --- | --- |
+  | Debian / Ubuntu | `sudo apt install build-essential pkg-config libasound2-dev` |
+  | Fedora | `sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel` |
+  | Arch | `sudo pacman -S base-devel pkgconf alsa-lib` |
+
+Linux is the tested platform. macOS and Windows may build, but are untested.
+
+### 2. Build
+
+```sh
+git clone https://github.com/scottadair/spotify-tui
+cd spotify-tui
+cargo install --path .     # installs `spotify-tui` into ~/.cargo/bin
+```
+
+Or build without installing: `cargo build --release`, and the binary is at `target/release/spotify-tui`.
+
+### 3. Create a Spotify app (one time)
+
+spotify-tui talks to the Spotify Web API through **your own** app, so you need a Client ID:
+
+1. Open the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and click **Create app**.
+2. Give it any name and description.
+3. Add the redirect URI **`http://127.0.0.1:8888/callback`** exactly.
+4. Under the APIs used, tick **Web API**, then save.
+5. Open the app's settings and copy its **Client ID**.
+
+### 4. First run
+
+```sh
+spotify-tui
+```
+
+On first run the app asks for your Client ID and saves it to the config file. Then it opens two browser logins, one time each:
+
+1. **Your app** (Web API: library, search, playlists).
+2. **The streaming device** (librespot's own client id, which Spotify requires for streaming).
+
+Both tokens are cached, so later launches go straight into the app.
+
+Both logins receive their callback on `127.0.0.1` (ports 8888 and 8898), so those ports must be free during the first run.
+
+## Keys
+
+Press `?` in the app for this list, and `,` for settings.
+
+| Navigate | | Playback | |
+| --- | --- | --- | --- |
+| `j` `k` / `↓` `↑` | move selection | `space` | play / pause |
+| `g` `G` | top / bottom | `n` `p` | next / previous |
+| `ctrl-d` `ctrl-u` | half page down / up | `<` `>` | seek −5s / +5s |
+| `←` `→` / `h` `l` / `tab` | switch pane | `+` `-` | volume |
+| `enter` | open / play | `s` | shuffle |
+| `esc` / `backspace` | back | `r` | cycle repeat |
+| `/` | search | `R` | start radio from the selection |
+
+| App | |
+| --- | --- |
+| `f` | full-screen player with album art |
+| `,` | settings |
+| `?` | key help |
+| `q` / `ctrl-c` | quit |
+
+## Configuration
+
+Settings live in `~/.config/spotify-tui/config.toml`. The settings screen (`,`) edits the same file. Changes apply on the next launch.
+
+```toml
+client_id = "your-32-character-client-id"
+device_name = "spotify-tui"   # name in Spotify Connect device lists
+bitrate = 320                 # 96, 160 or 320
+initial_volume = 50           # 0-100, used until a volume has been saved
+gapless = true
+normalisation = false         # even out loudness between tracks
+```
+
+Cached data lives in `~/.cache/spotify-tui/`:
+
+| Path | Contents |
+| --- | --- |
+| `web_token.json` | Web API refresh token |
+| `librespot/` | Streaming-device credentials and saved volume. Delete it to re-authorise the device. |
+| `data/` | Cached playlists, track lists and browse pages |
+| `spotify-tui.log` | Log file; check it first when something goes wrong |
+
+## How it works
+
+- `auth.rs`: PKCE login with a cached, auto-refreshing token for the Web API.
+- `player.rs`: librespot session, player and Spirc (the Connect device). The UI's playback state is driven by player events.
+- `api/`: Web API client. Paged lists stream in chunks, fetched concurrently.
+- `browse.rs`: the Browse page, from Spotify's live catalogue via the web player's GraphQL queries (authorised with the streaming session).
+- `cache.rs`: JSON disk cache. Browse pages and top artists use TTLs; playlists and track lists paint from cache, then refresh (skipped if less than 5 minutes old).
+- `app.rs`: state and input. `settings.rs`: the settings popup.
+- `ui/`: rendering, plus short pane transitions (`ui/anim.rs`) that only move cells and use the terminal's dim attribute, so they suit any colour scheme.
+
+## Caveats
+
+- Not affiliated with or endorsed by Spotify.
+- Browse uses undocumented endpoints of Spotify's web player, which can change without notice. The rest of the app uses the public Web API and librespot.
+- Spotify rate-limits the Web API per app. That's why you bring your own Client ID, and why librespot's client id is only used for streaming.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
