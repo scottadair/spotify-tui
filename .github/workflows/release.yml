@@ -1,0 +1,135 @@
+name: Release
+
+# A vX.Y.Z tag is a release: build x86_64 and aarch64 tarballs against glibc 2.28 and attach them to the GitHub release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing vX.Y.Z tag to build again'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_REF: ${{ inputs.ref || github.ref_name }}
+
+jobs:
+  # Nothing downstream may publish a version the tree does not agree on.
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Qualified, so a branch that shares the tag's name can never be what is checked out.
+          ref: ${{ inputs.ref && format('refs/tags/{0}', inputs.ref) || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: check
+        name: The tag and Cargo.toml agree
+        run: |
+          set -euo pipefail
+          ref="$RELEASE_REF"
+          [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::'$ref' is not a vX.Y.Z tag; releases build exact version tags only"; exit 1; }
+          version="${ref#v}"
+          sha=$(git rev-parse -q --verify "refs/tags/$ref^{commit}") \
+            || { echo "::error::tag '$ref' does not exist"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$sha" ] \
+            || { echo "::error::the checkout is not the commit tag '$ref' names"; exit 1; }
+          # Sample input: Cargo.toml line `version = "0.1.0"`.
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          [ "$cargo_version" = "$version" ] || {
+            echo "::error::Cargo.toml version is '$cargo_version' but the tag says '$version'"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # One native runner per architecture, inside AlmaLinux 8 so the binary needs nothing newer than glibc 2.28.
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: almalinux:8
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      # git first, so checkout clones instead of downloading a tarball.
+      - name: Install build dependencies
+        run: dnf install -y gcc git pkgconf-pkg-config alsa-lib-devel binutils tar gzip
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build, check and pack
+        run: packaging/build-dist "$VERSION" "$ARCH" dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spotify-tui-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Creates the release or attaches to one; it never replaces an asset already published.
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHASUMS256.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c ./*.sha256
+          sha256sum -- spotify-tui-*.tar.gz > SHASUMS256.txt
+
+      - name: Create the release or attach to it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_REF"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # gh refuses to overwrite an existing asset without --clobber, which is the point.
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --title "$tag" --verify-tag --generate-notes
+          fi

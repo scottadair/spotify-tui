@@ -26,6 +26,15 @@ The app **is its own Spotify Connect device**. Audio plays from your machine; th
 
 ## Install
 
+**Prebuilt binary:** each [release](https://github.com/scottadair/spotify-tui/releases) has `x86_64` and `aarch64` Linux tarballs. They run on any glibc distro with glibc 2.28+ (Debian 10, Ubuntu 20.04, RHEL 8 and newer; not musl distros like Alpine) and need only ALSA (`libasound.so.2`) at runtime. Unpack and put `spotify-tui` on your `PATH`, then skip to step 3:
+
+```sh
+tar -xzf spotify-tui-v*-linux-x86_64.tar.gz
+install -m755 spotify-tui-v*-linux-x86_64/spotify-tui ~/.local/bin/
+```
+
+To build from source instead, start at step 1.
+
 ### 1. Prerequisites
 
 - Rust **1.90+**. With [mise](https://mise.jdx.dev), `mise install` in the repo picks up the pinned toolchain; otherwise use [rustup](https://rustup.rs).

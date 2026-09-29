@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Build, check and pack the release tarball for one architecture.
+# Run it on a glibc 2.28 system (CI uses almalinux:8) so the binary starts on any distro from 2018 on.
+# Usage: packaging/build-dist <version> <arch> <outdir>
+set -euo pipefail
+
+version=$1 arch=$2 out=$3
+glibc_max=2.28
+bin="${CARGO_TARGET_DIR:-target}/release/spotify-tui"
+
+cargo test --release --locked
+cargo build --release --locked
+
+# Sample input: objdump -T line `0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.17) clock_gettime`.
+needed=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | cut -d_ -f2 | sort -uV | tail -n1)
+if [ "$(printf '%s\n' "$needed" "$glibc_max" | sort -V | tail -n1)" != "$glibc_max" ]; then
+  echo "::error::$bin needs glibc $needed; the release promises $glibc_max"
+  exit 1
+fi
+
+# Anything beyond glibc and ALSA is a runtime dependency users were never told about.
+# Sample input: readelf -d line ` 0x0000000000000001 (NEEDED)             Shared library: [libasound.so.2]`.
+extra=$(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' \
+  | grep -vE '^(libasound\.so\.2|libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[-a-z0-9_]*\.so\.[0-9])$' || true)
+if [ -n "$extra" ]; then
+  echo "::error::$bin links libraries outside glibc and ALSA: $extra"
+  exit 1
+fi
+echo "$bin: glibc <= $needed, links $(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | paste -sd' ')"
+
+name="spotify-tui-v$version-linux-$arch"
+stage=$(mktemp -d)
+mkdir "$stage/$name"
+install -m755 "$bin" "$stage/$name/spotify-tui"
+install -m644 README.md LICENSE-MIT LICENSE-APACHE "$stage/$name/"
+mkdir -p "$out"
+tar -czf "$out/$name.tar.gz" -C "$stage" "$name"
+(cd "$out" && sha256sum -- "$name.tar.gz" > "$name.tar.gz.sha256")
+rm -rf "$stage"
+echo "wrote $out/$name.tar.gz"
