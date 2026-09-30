@@ -611,7 +611,7 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         // The full-screen player answers transport keys, ← → for its Up Next pane, and list
-        // movement while that pane is open; everything else would act on hidden panes.
+        // movement and ⏎ while that pane is open; everything else would act on hidden panes.
         if self.fullscreen {
             let open = self.up_next_open;
             match k.code {
@@ -627,6 +627,7 @@ impl App {
                 | KeyCode::End
                     if open => {}
                 KeyCode::Char('d' | 'u') if open && ctrl => {}
+                KeyCode::Enter if open => return self.play_up_next(),
                 KeyCode::Char('q' | ' ' | 'n' | 'p' | 's' | 'r' | '+' | '=' | '-' | '>' | '<' | '?' | 'f' | ',')
                 | KeyCode::Esc
                 | KeyCode::Backspace => {}
@@ -789,6 +790,19 @@ impl App {
         });
     }
 
+    /// Jumps to the selected Up Next track by skipping everything before it, so the rest of the
+    /// queue and context keep playing after it.
+    fn play_up_next(&mut self) {
+        let l = &mut self.up_next;
+        if l.loading {
+            return;
+        }
+        let Some(i) = l.state.selected().filter(|&i| i < l.tracks.len()) else { return };
+        self.player.skip(i + 1);
+        // The pane refreshes on the track change; the new first row is what follows it.
+        l.state.select(Some(0));
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let (len, sel): (usize, Option<usize>) = match self.focus {
             _ if self.fullscreen => (self.up_next.tracks.len(), self.up_next.state.selected()),
@@ -859,7 +873,7 @@ impl App {
                 let fixed = [Entry::Section(Section::Stations), Entry::Section(Section::Recent)];
                 let load = self.new_load();
                 self.view = Some(View::Entries(EntryList::new("Browse", fixed.to_vec(), true, load)));
-                let session = self.player.session().clone();
+                let session = self.player.session();
                 self.spawn_entries(
                     load,
                     "browse-hubs".into(),
@@ -894,7 +908,7 @@ impl App {
                     .iter()
                     .filter_map(|s| if let SidebarItem::Playlist(p) = s { Some(p.clone()) } else { None })
                     .collect();
-                let (api, session, tx) = (self.api.clone(), self.player.session().clone(), self.tx.clone());
+                let (api, session, tx) = (self.api.clone(), self.player.session(), self.tx.clone());
                 tokio::spawn(async move {
                     let result = async {
                         let uris = api.recent_playlist_uris().await?;
@@ -941,7 +955,7 @@ impl App {
         }
         let load = self.new_load();
         self.push_view(View::Entries(EntryList::new(section.label(), Vec::new(), true, load)));
-        let session = self.player.session().clone();
+        let session = self.player.session();
         match section {
             Section::Page(c) => self.spawn_entries(
                 load,
@@ -1181,7 +1195,7 @@ impl App {
 
     fn play_station(&mut self, name: String, seed: String) {
         self.toast(format!("Starting {name} radio…"));
-        let (session, tx) = (self.player.session().clone(), self.tx.clone());
+        let (session, tx) = (self.player.session(), self.tx.clone());
         tokio::spawn(async move {
             let result = browse::station_tracks(&session, &seed).await;
             let _ = tx.send(Event::Data(Data::Station { name, result }));

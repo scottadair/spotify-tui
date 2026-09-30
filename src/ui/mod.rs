@@ -699,7 +699,7 @@ fn draw_fullscreen(f: &mut Frame, app: &mut App, area: Rect) -> (Option<Rect>, O
     // Over the pane's bottom border, where the single player pane keeps its hints.
     let hints = Rect::new(queue.x + 1, queue.bottom().saturating_sub(1), queue.width.saturating_sub(2), 1);
     f.render_widget(
-        Line::from(hint_spans(&[("←/esc", "player"), ("f", "exit"), ("?", "help")], usize::from(hints.width)))
+        Line::from(hint_spans(&[("enter", "play"), ("←/esc", "player"), ("f", "exit"), ("?", "help")], usize::from(hints.width)))
             .centered(),
         hints,
     );

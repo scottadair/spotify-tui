@@ -18,7 +18,7 @@ The app **is its own Spotify Connect device**. Audio plays from your machine; th
 - **Search** across tracks, artists, albums and playlists.
 - **Browse** Spotify's live "Browse all" catalogue (genres, moods, charts and their sub-pages), plus radio stations from your top artists and a Recently Played list.
 - **Radio** from any track, artist or station (`R`).
-- **Full-screen player** with album art. Uses Kitty, Sixel or iTerm2 graphics when your terminal supports them, with coloured half-blocks everywhere else. `→` opens an Up Next pane beside it showing the real queue, including shuffle order and tracks you've queued.
+- **Full-screen player** with album art. Uses Kitty, Sixel or iTerm2 graphics when your terminal supports them, with coloured half-blocks everywhere else. `→` opens an Up Next pane beside it showing the real queue, including shuffle order and tracks you've queued; `enter` jumps to the selected track.
 - **Playback controls**: play/pause, next/previous, seek, volume, shuffle, repeat.
 - **Fast**: lists paint from a local cache instantly and refresh in the background. Playback state comes from player events, not polling, and the screen only redraws when something changes.
 - **Responsive layout**: two panes on wide terminals, one pane at a time on narrow ones.
@@ -100,7 +100,7 @@ Press `?` in the app for this list, and `,` for settings.
 | App | |
 | --- | --- |
 | `f` | full-screen player with album art |
-| `→` / `l` | up next (in the full-screen player; `←` / `esc` closes) |
+| `→` / `l` | up next (in the full-screen player; `enter` plays the selection, `←` / `esc` closes) |
 | `,` | settings |
 | `?` | key help |
 | `q` / `ctrl-c` | quit |

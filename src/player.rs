@@ -17,7 +17,11 @@ use librespot_playback::{
     mixer::{Mixer, MixerConfig, softmixer::SoftMixer},
     player::{Player, PlayerEvent},
 };
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use parking_lot::RwLock;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 
@@ -48,11 +52,16 @@ pub enum PlaybackEvent {
     Unavailable,
 }
 
+struct Inner {
+    spirc: Arc<Spirc>,
+    session: Session,
+}
+
 #[derive(Clone)]
 pub struct PlayerHandle {
-    spirc: Arc<Spirc>,
+    inner: Arc<RwLock<Inner>>,
     mixer: Arc<SoftMixer>,
-    session: Session,
+    shutting_down: Arc<AtomicBool>,
 }
 
 const STREAM_SCOPES: &[&str] = &[
@@ -87,6 +96,65 @@ pub struct Started {
     pub volume: u16,
 }
 
+/// Everything needed to (re)build the librespot session, player and Spirc.
+struct Connector {
+    cache: Cache,
+    mixer: Arc<SoftMixer>,
+    events: UnboundedSender<PlaybackEvent>,
+    name: String,
+    bitrate: Bitrate,
+    gapless: bool,
+    normalisation: bool,
+    fallback_volume: u16,
+}
+
+struct Connected {
+    spirc: Arc<Spirc>,
+    session: Session,
+    task: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Connector {
+    async fn connect(&self) -> Result<Connected> {
+        let creds = credentials(&self.cache).await?;
+        let session = Session::new(SessionConfig::default(), Some(self.cache.clone()));
+
+        let player_cfg = PlayerConfig {
+            bitrate: self.bitrate,
+            gapless: self.gapless,
+            normalisation: self.normalisation,
+            ..Default::default()
+        };
+        let backend = audio_backend::find(None).context("no audio backend compiled in")?;
+        let player = Player::new(player_cfg, session.clone(), self.mixer.get_soft_volume(), move || {
+            backend(None, AudioFormat::default())
+        });
+
+        // Forward player events before Spirc starts so nothing is missed.
+        let mut rx = player.get_player_event_channel();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if let Some(ev) = map_event(ev)
+                    && events.send(ev).is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let connect_cfg = ConnectConfig {
+            name: self.name.clone(),
+            initial_volume: self.cache.volume().unwrap_or(self.fallback_volume),
+            ..Default::default()
+        };
+        let (spirc, task) = Spirc::new(connect_cfg, session.clone(), creds, player, self.mixer.clone())
+            .await
+            .context("connecting to Spotify (delete the librespot cache dir to re-authorise)")?;
+        Ok(Connected { spirc: Arc::new(spirc), session, task: Box::pin(task) })
+    }
+}
+
 pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<PlaybackEvent>) -> Result<Started> {
     let cache = Cache::new(
         Some(paths.librespot_cache()),
@@ -94,9 +162,8 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
         None,
         None,
     )?;
-    let creds = credentials(&cache).await?;
-
-    let session = Session::new(SessionConfig::default(), Some(cache.clone()));
+    // Fail fast (and run any interactive login) before the TUI starts.
+    credentials(&cache).await?;
 
     let mixer = Arc::new(SoftMixer::open(MixerConfig::default())?);
     let volume = cache
@@ -109,41 +176,54 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
         160 => Bitrate::Bitrate160,
         _ => Bitrate::Bitrate320,
     };
-    let player_cfg = PlayerConfig {
+    let connector = Connector {
+        cache,
+        mixer: mixer.clone(),
+        events,
+        name: cfg.device_name.clone(),
         bitrate,
         gapless: cfg.gapless,
         normalisation: cfg.normalisation,
-        ..Default::default()
+        fallback_volume: volume,
     };
-    let backend = audio_backend::find(None).context("no audio backend compiled in")?;
-    let player = Player::new(player_cfg, session.clone(), mixer.get_soft_volume(), move || {
-        backend(None, AudioFormat::default())
-    });
 
-    // Forward player events before Spirc starts so nothing is missed.
-    let mut rx = player.get_player_event_channel();
+    let first = connector.connect().await?;
+    let inner = Arc::new(RwLock::new(Inner { spirc: first.spirc, session: first.session }));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
+    // The Spirc task ends when the session drops (idle connection closed by Spotify, network
+    // change, ...). Nothing else revives it, so rebuild everything and swap it into the handle.
+    let (sup_inner, sup_flag) = (inner.clone(), shutting_down.clone());
+    let mut task = first.task;
     tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let Some(ev) = map_event(ev)
-                && events.send(ev).is_err()
-            {
-                break;
+        loop {
+            (&mut task).await;
+            if sup_flag.load(Ordering::Relaxed) {
+                return;
             }
+            tracing::warn!("Spotify connection lost; reconnecting");
+            let _ = connector.events.send(PlaybackEvent::Stopped);
+            let mut delay = Duration::from_secs(1);
+            let next = loop {
+                tokio::time::sleep(delay).await;
+                if sup_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                match connector.connect().await {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        tracing::warn!("reconnect failed: {e:#}");
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                }
+            };
+            *sup_inner.write() = Inner { spirc: next.spirc, session: next.session };
+            task = next.task;
+            tracing::info!("Spotify reconnected");
         }
     });
 
-    let connect_cfg = ConnectConfig {
-        name: cfg.device_name.clone(),
-        initial_volume: volume,
-        ..Default::default()
-    };
-    let handle_session = session.clone();
-    let (spirc, task) = Spirc::new(connect_cfg, session, creds, player, mixer.clone())
-        .await
-        .context("connecting to Spotify (delete the librespot cache dir to re-authorise)")?;
-    tokio::spawn(task);
-
-    Ok(Started { handle: PlayerHandle { spirc: Arc::new(spirc), mixer, session: handle_session }, volume })
+    Ok(Started { handle: PlayerHandle { inner, mixer, shutting_down }, volume })
 }
 
 fn map_event(ev: PlayerEvent) -> Option<PlaybackEvent> {
@@ -191,14 +271,15 @@ impl PlayerHandle {
         mut on_chunk: impl FnMut(Vec<ApiTrack>, u32),
     ) -> Result<()> {
         let uri = SpotifyUri::from_uri(uri)?;
-        let list = MetaPlaylist::get(&self.session, &uri).await?;
+        let session = self.session();
+        let list = MetaPlaylist::get(&session, &uri).await?;
         let ids: Vec<SpotifyUri> = list
             .tracks()
             .filter(|u| matches!(u, SpotifyUri::Track { .. }))
             .cloned()
             .collect();
         let total = ids.len() as u32;
-        let session = &self.session;
+        let session = &session;
         let owned: Vec<Vec<SpotifyUri>> = ids.chunks(20).map(<[_]>::to_vec).collect();
         let mut chunks = stream::iter(owned).map(|c| fetch_chunk(session, c)).buffered(4);
         while let Some(results) = chunks.next().await {
@@ -209,30 +290,39 @@ impl PlayerHandle {
     }
 
     pub fn play_pause(&self) {
-        let _ = self.spirc.play_pause();
+        let _ = self.spirc().play_pause();
     }
     pub fn next(&self) {
-        let _ = self.spirc.next();
+        self.skip(1);
+    }
+    /// Advance `count` tracks through the queue and context, keeping both (and shuffle order)
+    /// intact. Spirc handles commands in order, so only the last skip's track plays.
+    pub fn skip(&self, count: usize) {
+        let spirc = self.spirc();
+        for _ in 0..count {
+            let _ = spirc.next();
+        }
     }
     pub fn prev(&self) {
-        let _ = self.spirc.prev();
+        let _ = self.spirc().prev();
     }
     pub fn seek(&self, ms: u32) {
-        let _ = self.spirc.set_position_ms(ms);
+        let _ = self.spirc().set_position_ms(ms);
     }
     pub fn shuffle(&self, on: bool) {
-        let _ = self.spirc.shuffle(on);
+        let _ = self.spirc().shuffle(on);
     }
     /// Cycle repeat: off -> context -> track -> off, given the current mode.
     pub fn repeat(&self, context: bool, track: bool) {
+        let spirc = self.spirc();
         let _ = match (context, track) {
-            (false, false) => self.spirc.repeat(true),
-            (true, false) => self.spirc.repeat_track(true),
-            _ => self.spirc.repeat(false).and_then(|_| self.spirc.repeat_track(false)),
+            (false, false) => spirc.repeat(true),
+            (true, false) => spirc.repeat_track(true),
+            _ => spirc.repeat(false).and_then(|_| spirc.repeat_track(false)),
         };
     }
     pub fn set_volume(&self, volume: u16) {
-        let _ = self.spirc.set_volume(volume);
+        let _ = self.spirc().set_volume(volume);
         self.mixer.set_volume(volume);
     }
 
@@ -247,8 +337,9 @@ impl PlayerHandle {
     /// Spirc ignores every command unless this device is the active Connect device, and another
     /// device may have taken over since we last played. Activating first is a no-op if we're active.
     fn load(&self, request: LoadRequest) {
-        let _ = self.spirc.activate();
-        let _ = self.spirc.load(request);
+        let spirc = self.spirc();
+        let _ = spirc.activate();
+        let _ = spirc.load(request);
     }
 
     /// Play a playlist/album/artist context starting at `index`.
@@ -261,13 +352,19 @@ impl PlayerHandle {
         self.load(LoadRequest::from_tracks(uris, Self::opts(index)));
     }
 
-    /// The streaming session, for metadata/browse endpoints the Web API no longer serves.
-    pub fn session(&self) -> &Session {
-        &self.session
+    /// The current streaming session, for metadata/browse endpoints the Web API no longer serves.
+    /// Replaced on reconnect, so don't hold it long-term.
+    pub fn session(&self) -> Session {
+        self.inner.read().session.clone()
     }
 
     pub fn shutdown(&self) {
-        let _ = self.spirc.shutdown();
+        self.shutting_down.store(true, Ordering::Relaxed);
+        let _ = self.spirc().shutdown();
+    }
+
+    fn spirc(&self) -> Arc<Spirc> {
+        self.inner.read().spirc.clone()
     }
 }
 

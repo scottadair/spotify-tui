@@ -4272,6 +4272,7 @@ dependencies = [
  "librespot-metadata",
  "librespot-oauth",
  "librespot-playback",
+ "parking_lot",
  "ratatui",
  "ratatui-image",
  "reqwest 0.13.5",
