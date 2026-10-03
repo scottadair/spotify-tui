@@ -12,8 +12,10 @@ use librespot_core::{Session, SessionConfig, authentication::Credentials, cache:
 use librespot_metadata::audio::UniqueFields;
 use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::{
-    audio_backend,
+    audio_backend::{self, Sink, SinkBuilder, SinkError, SinkResult},
     config::{AudioFormat, Bitrate, PlayerConfig},
+    convert::Converter,
+    decoder::AudioPacket,
     mixer::{Mixer, MixerConfig, softmixer::SoftMixer},
     player::{Player, PlayerEvent},
 };
@@ -125,9 +127,9 @@ impl Connector {
             normalisation: self.normalisation,
             ..Default::default()
         };
-        let backend = audio_backend::find(None).context("no audio backend compiled in")?;
+        let build = audio_backend::find(None).context("no audio backend compiled in")?;
         let player = Player::new(player_cfg, session.clone(), self.mixer.get_soft_volume(), move || {
-            backend(None, AudioFormat::default())
+            Box::new(PerPlaySink { build, format: AudioFormat::default(), inner: None })
         });
 
         // Forward player events before Spirc starts so nothing is missed.
@@ -393,4 +395,46 @@ fn to_api_track(t: MetaTrack) -> Option<ApiTrack> {
 
 async fn fetch_chunk(session: &Session, ids: Vec<SpotifyUri>) -> Vec<Result<MetaTrack, librespot_core::Error>> {
     join_all(ids.iter().map(|id| MetaTrack::get(session, id))).await
+}
+
+/// Opens the real output device on `start` and releases it on `stop`. librespot otherwise
+/// opens the device once for the Player's lifetime, so an ALSA stream killed by suspend/resume
+/// (`POLLERR`) stays dead forever; this reopens it on the next play.
+struct PerPlaySink {
+    build: SinkBuilder,
+    format: AudioFormat,
+    inner: Option<Box<dyn Sink>>,
+}
+
+impl PerPlaySink {
+    fn open(&mut self) -> SinkResult<&mut Box<dyn Sink>> {
+        if self.inner.is_none() {
+            let (build, format) = (self.build, self.format);
+            // The rodio backend panics if the device can't be opened (e.g. just after resume).
+            let sink = std::panic::catch_unwind(move || build(None, format))
+                .map_err(|_| SinkError::NotConnected("audio device unavailable".into()))?;
+            self.inner = Some(sink);
+        }
+        Ok(self.inner.as_mut().expect("just opened"))
+    }
+}
+
+impl Sink for PerPlaySink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.open()?.start()
+    }
+
+    fn stop(&mut self) -> SinkResult<()> {
+        if let Some(sink) = self.inner.take() {
+            // The device buffer holds at most ~0.5s. A fixed wait lets it play out without the
+            // unbounded `sleep_until_end`, which would hang forever on a dead stream.
+            std::thread::sleep(Duration::from_millis(500));
+            drop(sink);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        self.open()?.write(packet, converter)
+    }
 }
