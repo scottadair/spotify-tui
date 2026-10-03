@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod audio;
 mod auth;
 mod browse;
 mod cache;

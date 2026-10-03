@@ -12,15 +12,14 @@ use librespot_core::{Session, SessionConfig, authentication::Credentials, cache:
 use librespot_metadata::audio::UniqueFields;
 use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::{
-    audio_backend::{self, Sink, SinkBuilder, SinkError, SinkResult},
-    config::{AudioFormat, Bitrate, PlayerConfig},
-    convert::Converter,
-    decoder::AudioPacket,
+    config::{Bitrate, PlayerConfig},
     mixer::{Mixer, MixerConfig, softmixer::SoftMixer},
     player::{Player, PlayerEvent},
 };
+use crate::audio::ResilientSink;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,9 +126,8 @@ impl Connector {
             normalisation: self.normalisation,
             ..Default::default()
         };
-        let build = audio_backend::find(None).context("no audio backend compiled in")?;
-        let player = Player::new(player_cfg, session.clone(), self.mixer.get_soft_volume(), move || {
-            Box::new(PerPlaySink { build, format: AudioFormat::default(), inner: None })
+        let player = Player::new(player_cfg, session.clone(), self.mixer.get_soft_volume(), || {
+            Box::new(ResilientSink::default())
         });
 
         // Forward player events before Spirc starts so nothing is missed.
@@ -222,6 +220,28 @@ pub async fn start(cfg: &Config, paths: &Paths, events: UnboundedSender<Playback
             *sup_inner.write() = Inner { spirc: next.spirc, session: next.session };
             task = next.task;
             tracing::info!("Spotify reconnected");
+        }
+    });
+
+    // After suspend the old TCP connection is usually dead but silent (monotonic clocks, which
+    // librespot's ping timeout uses, don't advance while asleep), so it would linger for up to
+    // 80s. Wall-clock time jumping ahead of the monotonic clock means we slept: drop the session
+    // so the supervisor above reconnects right away.
+    let (wake_inner, wake_flag) = (inner.clone(), shutting_down.clone());
+    tokio::spawn(async move {
+        const TICK: Duration = Duration::from_secs(2);
+        const SLEPT: Duration = Duration::from_secs(5);
+        let (mut wall, mut mono) = (SystemTime::now(), Instant::now());
+        while !wake_flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(TICK).await;
+            let (wall_now, mono_now) = (SystemTime::now(), Instant::now());
+            let wall_el = wall_now.duration_since(wall).unwrap_or_default();
+            if wall_el.saturating_sub(mono_now.duration_since(mono)) >= SLEPT {
+                tracing::info!("system resumed from sleep; refreshing the Spotify connection");
+                let session = wake_inner.read().session.clone();
+                session.shutdown();
+            }
+            (wall, mono) = (wall_now, mono_now);
         }
     });
 
@@ -395,46 +415,4 @@ fn to_api_track(t: MetaTrack) -> Option<ApiTrack> {
 
 async fn fetch_chunk(session: &Session, ids: Vec<SpotifyUri>) -> Vec<Result<MetaTrack, librespot_core::Error>> {
     join_all(ids.iter().map(|id| MetaTrack::get(session, id))).await
-}
-
-/// Opens the real output device on `start` and releases it on `stop`. librespot otherwise
-/// opens the device once for the Player's lifetime, so an ALSA stream killed by suspend/resume
-/// (`POLLERR`) stays dead forever; this reopens it on the next play.
-struct PerPlaySink {
-    build: SinkBuilder,
-    format: AudioFormat,
-    inner: Option<Box<dyn Sink>>,
-}
-
-impl PerPlaySink {
-    fn open(&mut self) -> SinkResult<&mut Box<dyn Sink>> {
-        if self.inner.is_none() {
-            let (build, format) = (self.build, self.format);
-            // The rodio backend panics if the device can't be opened (e.g. just after resume).
-            let sink = std::panic::catch_unwind(move || build(None, format))
-                .map_err(|_| SinkError::NotConnected("audio device unavailable".into()))?;
-            self.inner = Some(sink);
-        }
-        Ok(self.inner.as_mut().expect("just opened"))
-    }
-}
-
-impl Sink for PerPlaySink {
-    fn start(&mut self) -> SinkResult<()> {
-        self.open()?.start()
-    }
-
-    fn stop(&mut self) -> SinkResult<()> {
-        if let Some(sink) = self.inner.take() {
-            // The device buffer holds at most ~0.5s. A fixed wait lets it play out without the
-            // unbounded `sleep_until_end`, which would hang forever on a dead stream.
-            std::thread::sleep(Duration::from_millis(500));
-            drop(sink);
-        }
-        Ok(())
-    }
-
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        self.open()?.write(packet, converter)
-    }
 }

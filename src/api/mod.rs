@@ -57,11 +57,14 @@ impl Api {
         // One retry on 429 honoring Retry-After.
         for attempt in 0..2 {
             let token = self.auth.access_token().await?;
-            let resp = self.http.get(&url).bearer_auth(token).query(query).send().await?;
+            let resp = self.http.get(&url).bearer_auth(&token).query(query).send().await?;
             match resp.status() {
                 s if s.is_success() => {
                     return resp.json().await.with_context(|| format!("decoding {path}"));
                 }
+                // The cached expiry is monotonic, so it lags real time after suspend and the
+                // token can be dead while we still think it's valid.
+                StatusCode::UNAUTHORIZED if attempt == 0 => self.auth.invalidate(&token).await,
                 StatusCode::TOO_MANY_REQUESTS if attempt == 0 => {
                     let secs = resp
                         .headers()

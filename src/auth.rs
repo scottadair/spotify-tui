@@ -135,6 +135,15 @@ impl WebAuth {
         }
         Ok(cur.access_token.clone())
     }
+
+    /// Mark `stale` as unusable so the next `access_token` refreshes. A no-op if another
+    /// caller already replaced it.
+    pub async fn invalidate(&self, stale: &str) {
+        let mut cur = self.current.lock().await;
+        if cur.access_token == stale {
+            cur.expires_at = Instant::now();
+        }
+    }
 }
 
 fn write_private(path: &std::path::Path, data: &[u8]) {
